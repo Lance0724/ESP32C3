@@ -13,9 +13,19 @@ struct BlinkerSlider {
     explicit BlinkerSlider(const char*) {}
     void attach(void (*)(int32_t)) {}
 };
+inline uint32_t host_blinker_wait_ms = 0;
+inline void (*host_blinker_wait_tick)() = nullptr;
 struct HostBlinker {
     template<class... T> void begin(T...) {}
-    void run() {}
+    void run() {
+        uint32_t remaining = host_blinker_wait_ms;
+        while (remaining) {
+            const uint32_t step = remaining < 4 ? remaining : 4;
+            host_now += step;
+            remaining -= step;
+            if (host_blinker_wait_tick) host_blinker_wait_tick();
+        }
+    }
 };
 inline HostBlinker Blinker;
 struct HostBlinkerMiot {

@@ -1,5 +1,6 @@
 #include "Harness.h"
 #include "Blinker.h"
+#include "CalibController.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -17,6 +18,12 @@ extern void slider1_callback(int32_t);
 extern void miotPowerState(const String&);
 extern void miotColor(int32_t);
 extern void miotMode(uint8_t);
+extern void oled_checks();
+extern void controller_checks();
+extern void assert_oled_four_rows();
+extern void save_oled_frame(const char *name);
+extern void loop();
+extern unsigned char Oled_GRAM[PAGE_SIZE][WIDTH];
 
 static void close_to(float actual, float expected) {
     assert(std::isfinite(actual) && std::fabs(actual - expected) < 0.001f);
@@ -97,6 +104,7 @@ static uint32_t voltage_for(float temperature) {
     return best;
 }
 static uint32_t room_mv, warm_mv, mid_mv, high_mv, trip_mv;
+static uint32_t plateau_mv, near_edge_mv, outside_mv;
 static void adc_checks() {
     ADC local;
     assert(!local.snapshot().ready);
@@ -220,11 +228,22 @@ static void pwm_checks() {
     assert(EEPROM.writes == writes);
     assert(!eeprom.save_calib_data(example()));
     eeprom.write_flg = 0;
+    const int budget = static_cast<int>(std::floor(
+        std::min(1.0, POWER_SUPPLY * BED_RESISTOR / (VIN * VIN)) * 255.0));
+    const int limit = std::min<int>(pwm.BED_PWM_PUT, budget);
     for (uint8_t point = 1; point <= 3; ++point) {
         assert(pwm.set_calibration_point(point));
         pwm_irq();
-        const int expected[] = {0, 19, 46, 79};
-        assert(host_pwm[HEB_PIN] == expected[point]);
+        assert(host_pwm[HEB_PIN] > 0 && host_pwm[HEB_PIN] <= limit);
+        assert(pwm.calibration_status().duty == host_pwm[HEB_PIN]);
+        const int unchanged = host_pwm[HEB_PIN];
+        pwm_irq();
+        assert(host_pwm[HEB_PIN] == unchanged);
+        if (point == 1) {
+            sample(adc, warm_mv); pwm.calibration_heartbeat(); pwm_irq();
+            assert(pwm.calibration_active() && host_pwm[HEB_PIN] < unchanged);
+            assert(adc.snapshot().raw_temp < 50 && adc.snapshot().instant_temp > 99);
+        }
     }
     const auto old_mode = pwm.temp_mode;
     const auto old_target = pwm.temp_buf;
@@ -324,31 +343,142 @@ static void run_ui(uint32_t duration, uint32_t mv) {
         ui.run_task(); pwm_irq();
     }
 }
+static void assert_oled_row(unsigned row, const char *text) {
+    const size_t length = std::strlen(text);
+    assert(row < PAGE_SIZE && length <= 21);
+    for (size_t i = 0; i < length; ++i)
+        assert(text[i] >= ' ' && text[i] <= '~' && text[i] != '%');
+    for (unsigned x = 0; x < WIDTH; ++x) {
+        const unsigned char expected = x < length * 6 ?
+            F6X8[static_cast<unsigned char>(text[x / 6]) - ' '][x % 6] : 0;
+        assert(Oled_GRAM[row][x] == expected);
+    }
+}
+static void assert_raw_row() {
+    char text[22];
+    std::snprintf(text, sizeof(text), "RAW %.1fC UNMAPPED",
+                  static_cast<double>(adc.snapshot().raw_temp));
+    assert_oled_row(1, text);
+}
+static void set_reference(unsigned value) {
+    const unsigned initial = static_cast<unsigned>(std::lround(adc.snapshot().raw_temp));
+    for (unsigned i = std::min(initial, value); i < std::max(initial, value); ++i) {
+        ++host_now;
+        ui_key_callb(ec11_task_is_encode, value > initial ? 1 : -1);
+        ui.run_task();
+    }
+    char text[22];
+    std::snprintf(text, sizeof(text), "REF %uC CLICK: OK", value);
+    assert_oled_row(2, text);
+}
+static void refresh_ui() {
+    host_now += 200;
+    ui.run_task();
+    pwm_irq();
+}
 static void enter_ui() {
     page_num = 2; page2_menu_num = 7;
     ui.page_switch_flg = false; ui.oled_sleep_flg = false; ui.wake_sleep_change_flg = false;
     press(sw_long);
     assert(page_num == 3 && !pwm.calibration_active());
+    assert(host_pwm[HEB_PIN] == 0);
+    assert_oled_four_rows();
+    save_oled_frame("calibration-confirm");
     press(sw_click);
     assert(pwm.calibration_active() && pwm.calibration_status().point == 0);
+    assert_oled_four_rows();
+    save_oled_frame("calibration-wait");
 }
 static void ui_checks() {
     room_and_unlock();
+    assert(adc.set_calibration(example()));
     eeprom.write_flg = 0;
     ec11.speed_up(true); ec11.double_click(true);
     enter_ui();
     run_ui(32500, room_mv);
     assert(host_pwm[HEB_PIN] == 0);
+    assert_oled_four_rows();
+    assert_oled_row(0, "P0 ROOM / NO HEAT");
+    assert_raw_row();
+    assert_oled_row(3, "HOLD: LOCAL STOP");
+    save_oled_frame("calibration-input");
+    // 错误不能遮住外部实测值及本地停止提示。
+    set_reference(41); press(sw_click);
+    assert_oled_row(0, "P0 ROOM REF CHECK");
+    assert_oled_row(2, "REF 41C CLICK: OK");
+    assert_oled_row(3, "HOLD: LOCAL STOP");
+    save_oled_frame("calibration-reference-error");
+    for (unsigned i = 27; i < 41; ++i) {
+        ++host_now; ui_key_callb(ec11_task_is_encode, -1); ui.run_task();
+    }
+    float captured_raw[4] = {adc.snapshot().raw_temp, 0, 0, 0};
+    const uint16_t entered[] = {27, 105, 166, 207};
     press(sw_click); assert(pwm.calibration_status().point == 1);
-    run_ui(40500, warm_mv);
-    // 输入时失稳后，确认键不能保存早先raw或跳入下一点。
-    host_adc_mv = mid_mv; host_now += 1000; adc.get_temp_task(); ui.run_task(); pwm_irq();
+    pwm_irq();
+    assert(host_pwm[HEB_PIN] > 0);
+    assert_oled_row(0, "P1 TARGET 100C");
+    assert_oled_row(2, "HEATING TO TARGET");
+    assert_raw_row();
+    save_oled_frame("calibration-heating");
+
+    // 室温及80℃的平坦平台都不能替代目标附近的新窗口。
+    run_ui(33000, room_mv);
     press(sw_click); assert(pwm.calibration_status().point == 1);
-    run_ui(40500, warm_mv);
+    refresh_ui(); assert_oled_row(2, "HEATING TO TARGET");
+    run_ui(40500, plateau_mv);
+    press(sw_click); assert(pwm.calibration_status().point == 1);
+    refresh_ui(); assert_oled_row(2, "HEATING TO TARGET");
+    run_ui(1000, near_edge_mv);
+    assert(std::fabs(adc.snapshot().instant_temp - calibration_target(1)) <= 2);
+    assert(std::fabs(adc.snapshot().raw_temp - calibration_target(1)) > 2);
+    refresh_ui(); assert_oled_row(2, "HEATING TO TARGET");
+    for (unsigned i = 0; i < 8 &&
+         !calibration_near_target(1, adc.snapshot().raw_temp, adc.snapshot().instant_temp); ++i)
+        run_ui(1000, near_edge_mv);
+    assert(calibration_near_target(1, adc.snapshot().raw_temp, adc.snapshot().instant_temp));
+    run_ui(29000, near_edge_mv);
+    press(sw_click); assert(pwm.calibration_status().point == 1);
+    run_ui(10000, near_edge_mv);
+    assert_oled_four_rows();
+    assert_raw_row();
+    set_reference(107);
+    save_oled_frame("calibration-heated-input");
+
+    // 瞬时值越出目标，即使均值及原窗口范围仍合格，也必须丢弃待录入值。
+    const auto previous = adc.snapshot();
+    host_adc_mv = outside_mv; host_now += 1000; adc.get_temp_task();
+    const auto outside = adc.snapshot();
+    assert(std::fabs(outside.raw_temp - calibration_target(1)) <= 2);
+    assert(std::fabs(outside.instant_temp - calibration_target(1)) > 2);
+    assert(std::fabs(outside.raw_temp - previous.raw_temp) < 1);
+    assert(std::fabs(outside.instant_temp - previous.instant_temp) < 2);
+    ui_key_callb(ec11_task_is_key, sw_click);
+    ui.run_task(); pwm_irq();
+    assert(pwm.calibration_status().point == 1);
+    assert_oled_row(0, "P1 100C UNSTABLE");
+    assert_oled_row(2, "HEATING TO TARGET");
+    save_oled_frame("calibration-left-target");
+    run_ui(29000, near_edge_mv);
+    press(sw_click); assert(pwm.calibration_status().point == 1);
+    run_ui(10000, near_edge_mv);
+    char reset_value[22];
+    std::snprintf(reset_value, sizeof(reset_value), "REF %uC CLICK: OK",
+                  static_cast<unsigned>(std::lround(adc.snapshot().raw_temp)));
+    assert_oled_row(2, reset_value);
+    set_reference(entered[1]);
+    captured_raw[1] = adc.snapshot().raw_temp;
     press(sw_click); assert(pwm.calibration_status().point == 2);
     run_ui(40500, mid_mv);
+    assert_oled_row(0, "P2 TARGET 160C");
+    assert_raw_row();
+    set_reference(entered[2]);
+    captured_raw[2] = adc.snapshot().raw_temp;
     press(sw_click); assert(pwm.calibration_status().point == 3);
     run_ui(40500, high_mv);
+    assert_oled_row(0, "P3 TARGET 200C");
+    assert_raw_row();
+    set_reference(entered[3]);
+    captured_raw[3] = adc.snapshot().raw_temp;
     const unsigned before = EEPROM.commits;
     press(sw_click);
     assert(!pwm.calibration_can_save() && EEPROM.commits == before);
@@ -357,10 +487,22 @@ static void ui_checks() {
     ui.run_task(); ui.run_task();
     assert(adc.has_calibration() && EEPROM.commits == before + 1);
     ui.run_task(); assert(EEPROM.commits == before + 1);
-    std::cout << "UI simulated 128x32 text surface (not physical OLED):\n";
-    for (const auto &row : oled.rows) std::cout << '|' << row.data() << "|\n";
+    TempCalibData persisted;
+    assert(decode_temp_calib(EEPROM.flash.data() + temp_calib_record_add, persisted));
+    for (unsigned point = 0; point < CALIB_POINT_NUM; ++point) {
+        assert(std::fabs(persisted.raw_temp[point] - captured_raw[point]) <= 0.051f);
+        assert(persisted.real_temp[point] == entered[point]);
+        assert(persisted.real_temp[point] != calibration_target(point));
+        close_to(adc.calibrate_temp(persisted.raw_temp[point]), entered[point]);
+    }
+    assert_oled_four_rows();
+    save_oled_frame("calibration-success");
     press(sw_long);
     assert(page_num == 2 && ec11.speed_up_enabled() && ec11.double_click_enabled());
+    adc.clear_calibration(); eeprom.read_all_data();
+    assert(adc.has_calibration());
+    for (unsigned point = 0; point < CALIB_POINT_NUM; ++point)
+        close_to(adc.calibrate_temp(persisted.raw_temp[point]), entered[point]);
     room_and_unlock();
     enter_ui(); run_ui(32500, room_mv); press(sw_click); pwm_irq();
     assert(host_pwm[HEB_PIN] > 0);
@@ -372,12 +514,67 @@ static void ui_checks() {
     pwm_irq(); stopped(CalibStop::Cancelled);
     ui.run_task();
     assert(page_num == 2 && EEPROM.commits == unchanged && eeprom.write_flg == 0);
-    std::cout << "PASS UI: full four-point flow, unstable input rejection, stop-before-save, queue-full cancel\n";
+    std::cout << "PASS UI: near-target windows, REF target loss, external pairs/reload, visible errors, stop-before-save, queue-full cancel\n";
+}
+
+static void network_calibration_checks() {
+    room_and_unlock();
+    eeprom.write_flg = 0;
+    miot.miot_able = true;
+    miot.wifi_conect_flg = true;
+    enter_ui();
+    run_ui(32500, room_mv);
+    press(sw_click);
+    pwm_irq();
+    assert(pwm.calibration_status().point == 1 && host_pwm[HEB_PIN] > 0);
+
+    // 网络等待期间监督定时器仍执行，模拟主循环被同步调用阻塞。
+    host_blinker_wait_ms = 1000;
+    host_blinker_wait_tick = pwm_irq;
+    const unsigned commits = EEPROM.commits;
+    const uint32_t started = host_now;
+    for (unsigned i = 0; i < 1000; ++i) {
+        loop();
+        pwm_irq();
+        assert(pwm.calibration_active());
+        assert(pwm.calibration_status().reason == CalibStop::None);
+        assert(host_pwm[HEB_PIN] > 0);
+    }
+    assert(static_cast<uint32_t>(host_now - started) == 1000);
+    assert(EEPROM.commits == commits);
+    assert_oled_four_rows();
+    assert_oled_row(0, "P1 TARGET 100C");
+    assert_raw_row();
+    assert_oled_row(2, "HEATING TO TARGET");
+    assert_oled_row(3, "HOLD:STOP / NET PAUSE");
+    save_oled_frame("calibration-network-paused");
+
+    ui_key_callb(ec11_task_is_key, sw_long);
+    loop();
+    pwm_irq();
+    stopped(CalibStop::Cancelled);
+    assert(page_num == 2 && EEPROM.commits == commits);
+    const uint32_t stopped_at = host_now;
+    loop();
+    assert(static_cast<uint32_t>(host_now - stopped_at) >= 1000);
+    assert(host_pwm[HEB_PIN] == 0 && !pwm.power);
+
+    host_blinker_wait_ms = 0;
+    host_blinker_wait_tick = nullptr;
+    miot.miot_able = false;
+    miot.wifi_conect_flg = false;
+    room_and_unlock();
+    std::cout << "PASS network calibration: real loop survives blocking network, local stop, networking resumes without reheating\n";
 }
 int main() {
     model_checks();
+    oled_checks();
+    controller_checks();
     room_mv = voltage_for(25); warm_mv = voltage_for(100); mid_mv = voltage_for(160);
-    high_mv = voltage_for(220); trip_mv = voltage_for(235);
+    high_mv = voltage_for(200); trip_mv = voltage_for(235);
+    plateau_mv = voltage_for(80); near_edge_mv = voltage_for(101.5f);
+    outside_mv = voltage_for(102.5f);
     adc_checks(); storage_checks(); stability_checks(); pwm_checks(); ui_checks();
+    network_calibration_checks();
     std::cout << "All calibration behavior checks passed; electrical timing and heating remain unverified.\n";
 }

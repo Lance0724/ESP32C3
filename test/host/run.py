@@ -21,8 +21,8 @@ elif importlib.util.find_spec("ziglang"):
         compiler += ["-target", "x86_64-windows-gnu"]
 else:
     raise SystemExit("需要C++编译器：设置CXX或安装g++/clang++/python -m pip install ziglang")
-sources = ["test/host/calibration_test.cpp"] + [f"src/{name}.cpp" for name in (
-    "TempCalibration", "ADC", "PWM", "eeprom_flash", "EC11", "ui", "MIOT", "Tick_IRQ"
+sources = ["test/host/calibration_test.cpp", "test/host/controller_test.cpp", "test/host/oled_test.cpp"] + [f"src/{name}.cpp" for name in (
+    "TempCalibration", "ADC", "PWM", "eeprom_flash", "EC11", "ui", "MIOT", "Tick_IRQ", "Oled", "main"
 )]
 with tempfile.TemporaryDirectory(prefix="esp32-calibration-") as directory:
     executable = Path(directory) / ("calibration.exe" if os.name == "nt" else "calibration")

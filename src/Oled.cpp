@@ -227,6 +227,18 @@ void Oled::choose_clr(unsigned char x,unsigned char y,unsigned char width, unsig
 
 void Oled::write_char(short x,short y,char chr,unsigned char Size,unsigned char mode)
 {       
+  const unsigned char character = static_cast<unsigned char>(chr);
+  if (character < ' ')
+    return;
+  const unsigned char index = character - ' ';
+  if (Size == 8)
+  {
+    if (index < sizeof(F6X8) / sizeof(F6X8[0]))
+      BMP(x, y, 6, 8, F6X8[index], mode);
+    return;
+  }
+  if (Size != 16 || index >= sizeof(F8X16) / 16)
+    return;
   unsigned char c,i=1,j; 
   short buf;
   unsigned char k,l;
@@ -358,6 +370,10 @@ void Oled::str(short x,short y,const void *chr,unsigned char Size,unsigned char 
   {
     csize = 8;
   }
+  else if(Size == 8)
+  {
+    csize = 6;
+  }
   else
   {
     return;
@@ -368,7 +384,7 @@ void Oled::str(short x,short y,const void *chr,unsigned char Size,unsigned char 
       return;
     write_char(x,y,*p++,Size,mode);
     x+=csize;
-    if(x>Oled_roll_x[1]-8)
+    if(x>Oled_roll_x[1]-csize)
     {
       if(fill)
       {

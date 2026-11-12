@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "workflow": "new-feature",
+  "mode": "standard",
+  "mode_history": [
+    {
+      "mode": "standard",
+      "reason": "改变校准加热控制与安全相关边界，采用标准模式；不改变持久化格式或普通温控"
+    }
+  ],
+  "phase": "completed",
+  "revision": 22,
+  "acceptance_ids": [
+    "AC-001",
+    "AC-002",
+    "AC-003",
+    "AC-004",
+    "AC-005"
+  ],
+  "design_ids": [
+    "DES-001",
+    "DES-002",
+    "DES-003",
+    "DES-004",
+    "DES-005"
+  ],
+  "gates": {
+    "requirements": "用户批准室温加100/160/200℃方案；功能、安全、显示及条件性上板标准完整",
+    "specification": "校准PID、目标门槛、保护、显示和上板条件均有明确设计",
+    "planning": "控制器和UI按共享接口并行，集成验证与上板按真实依赖执行；全部编号覆盖",
+    "execution": "全部AC/DES由已运行验证覆盖；软件控制、全流程、画面、构建、容量、隔离条件下烧录及用户物理页面确认均完成；真实热性能明确未验证，不冒充硬件加热认证"
+  },
+  "blocker": null,
+  "tasks": [
+    {
+      "id": "TASK-001",
+      "title": "实现校准专用受限PID及PWM集成",
+      "design_refs": [
+        "DES-001",
+        "DES-003"
+      ],
+      "acceptance_refs": [
+        "AC-001",
+        "AC-003"
+      ],
+      "depends_on": [],
+      "scope": [
+        "include/CalibController.h",
+        "include/PWM.h",
+        "src/PWM.cpp",
+        "test/host/controller_test.cpp"
+      ],
+      "completion_criteria": "新样本闭环、限幅、切点清理与全部停热保护成立，普通温控不变",
+      "verification_plan": "最终统一运行主机回归及生产控制器热模型烟测，检查控制边界和安全路径",
+      "status": "completed",
+      "reason": null,
+      "verification": {
+        "result": "passed",
+        "command": "python test/host/run.py；生产CalibPid与CalibStability的两组临时一阶热模型",
+        "observed": "控制器/PWM及原安全回归全部通过，P0为零，后三点输出限幅，新序列积分、抗饱和、切点/停止重置及时间回绕通过；两组假设热模型均在每点600秒内形成30秒稳定窗口并维持15秒，最大过冲5.823℃；模型不是实物证据",
+        "evidence_refs": [
+          "include/CalibController.h",
+          "test/host/controller_test.cpp",
+          "test/host/calibration_test.cpp"
+        ]
+      }
+    },
+    {
+      "id": "TASK-002",
+      "title": "实现目标邻域采点与四行界面并统一操作契约",
+      "design_refs": [
+        "DES-002",
+        "DES-004"
+      ],
+      "acceptance_refs": [
+        "AC-002",
+        "AC-004"
+      ],
+      "depends_on": [],
+      "scope": [
+        "src/ui.cpp",
+        "test/host/calibration_test.cpp",
+        "test/host/run.py",
+        "EC11与温度标定_PLAN.md",
+        ".ai/doc/ec11-temperature-calibration/requirements.md",
+        ".ai/doc/ec11-temperature-calibration/specification.md"
+      ],
+      "completion_criteria": "目标100/160/200、邻域完整窗口及真实参考配对贯通，页面与文档一致",
+      "verification_plan": "最终统一运行真实UI/OLED/PWM/loop主机检查并查看实际像素图",
+      "status": "completed",
+      "reason": null,
+      "verification": {
+        "result": "passed",
+        "command": "python test/host/run.py；打开pid-calibration-preview.png；同步原计划和需求/规范",
+        "observed": "室温及80℃的非目标平台被拒；目标邻域内新30秒窗口成立；瞬时离开目标清空REF；室温加100/160/200流程保存27/105/166/207℃外部值并重启加载；四行目标/RAW/录入/NET PAUSE像素清晰，普通温控契约未改",
+        "evidence_refs": [
+          "test/host/calibration_test.cpp",
+          "src/ui.cpp",
+          ".pio/host-oled-preview/pid-calibration-preview.png",
+          "EC11与温度标定_PLAN.md"
+        ]
+      }
+    },
+    {
+      "id": "TASK-003",
+      "title": "集成验证控制边界、热模型、画面与目标构建",
+      "design_refs": [
+        "DES-001",
+        "DES-002",
+        "DES-003",
+        "DES-004"
+      ],
+      "acceptance_refs": [
+        "AC-001",
+        "AC-002",
+        "AC-003",
+        "AC-004"
+      ],
+      "depends_on": [
+        "TASK-001",
+        "TASK-002"
+      ],
+      "scope": [
+        "test/host",
+        ".pio/build",
+        ".pio/host-oled-preview"
+      ],
+      "completion_criteria": "主机回归、假设热模型、可见画面和最终镜像容量均有真实结果",
+      "verification_plan": "记录实际python test/host/run.py、生产控制器临时热模型、PNG检查、pio构建和镜像容量输出",
+      "status": "completed",
+      "reason": null,
+      "verification": {
+        "result": "passed",
+        "command": "python test/host/run.py；生产控制器临时热模型；pio run -e esp32-c3-devkitm-1；最终bin/分区比较；实际GRAM预览",
+        "observed": "主机所有检查通过2.47秒；两组假设热模型达到目标邻域完整稳定窗并维持15秒（每点195～515秒范围的初步观察由最终252/212/207与515/503/451秒结果取代），最大模型过冲5.823℃；实际像素图通过；目标构建SUCCESS 28.84秒，RAM50444字节，程序段1254214字节，最终镜像1314864字节小于两个1966080字节应用槽；既有Blinker/OLED警告未扩展处理，模型不证明实物安全",
+        "evidence_refs": [
+          ".pio/host-oled-preview/pid-calibration-preview.png",
+          ".pio/build/esp32-c3-devkitm-1/firmware.bin",
+          "test/host/controller_test.cpp"
+        ]
+      }
+    },
+    {
+      "id": "TASK-004",
+      "title": "在隔离加热条件下烧录并确认物理页面",
+      "design_refs": [
+        "DES-005"
+      ],
+      "acceptance_refs": [
+        "AC-005"
+      ],
+      "depends_on": [
+        "TASK-003"
+      ],
+      "scope": [
+        "COM目标板"
+      ],
+      "completion_criteria": "目标设备可达且隔离条件明确，烧录哈希通过并获用户物理显示确认",
+      "verification_plan": "枚举串口、确认隔离授权、烧录并由用户检查目标页面和本地退出，不自动开启加热",
+      "status": "completed",
+      "reason": null,
+      "verification": {
+        "result": "passed",
+        "command": "用户确认加热电源隔离并授权；COM5完整esptool烧录；10秒被动串口观察；用户实物检查P0到P1与长按退出",
+        "observed": "设备VID303A/PID1001、MAC84:c7:bb:a8:95:cc匹配；应用镜像1314864字节及启动程序/分区表/OTA启动数据四区域哈希均通过；仅USB供电，未接通加热电源；10秒串口0字节、0条ROM启动横幅（不单凭无日志证明运行）；用户pid_surface=normal，确认P1 TARGET 100C、RAW和状态正常并能长按退出。真实加热、稳温、过冲和标定精度未执行，不包含在此物理页面验收内。",
+        "evidence_refs": [
+          ".pio/pid-calibration-after.log",
+          ".pio/build/esp32-c3-devkitm-1/firmware.bin"
+        ]
+      }
+    }
+  ]
+}

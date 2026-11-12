@@ -6,6 +6,7 @@
 #include <atomic>
 #include "ADC.h"
 #include "Tick_IRQ.h"
+#include "CalibController.h"
 
 
 #define VIN 20.0 //电源输入电压
@@ -106,6 +107,7 @@ class PWM{
     friend void pwm_irq();
     void calibration_tick();
     CalibStatus calib_status_;
+    CalibPid calib_pid_;
     std::atomic<uint32_t> calib_stop_{0};
     uint32_t calib_heartbeat_at_ = 0;
     uint32_t calib_point_at_ = 0;

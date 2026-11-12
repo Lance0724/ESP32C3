@@ -1,5 +1,6 @@
 #include "User.h"
 #include "bmp.h"
+#include "CalibController.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <stdio.h>
@@ -752,14 +753,25 @@ void UI::calibration_key(ec11_task_result_type ec_type, int16_t ec_value)
         return;
     const uint32_t now = millis();
     calibration_tick(now);
-    if (calib_state != CalibState::ENTER_VALUE || !calib_window.stable(now))
+    if (calib_state != CalibState::ENTER_VALUE)
         return;
+    const TempSample sample = adc.snapshot();
+    if (!sample.healthy || !sample.ready ||
+        static_cast<uint32_t>(now - sample.sampled_at) > CalibStability::max_gap_ms ||
+        !calibration_near_target(calib_point, sample.raw_temp, sample.instant_temp) ||
+        !calib_window.stable(now))
+    {
+        calib_state = CalibState::WAIT_STABLE;
+        calib_message = "UNSTABLE";
+        calibration_reset_window();
+        return;
+    }
     const float raw = calib_window.mean();
     if (calib_point == 0 &&
         (raw < 10.0f || raw > 40.0f || calib_real < 10 || calib_real > 40 ||
          fabsf(raw - static_cast<float>(calib_real)) > 10.0f))
     {
-        calib_message = "P0 ROOM / CHECK REF";
+        calib_message = "REF CHECK";
         calib_dirty = true;
         return;
     }
@@ -768,7 +780,7 @@ void UI::calibration_key(ec11_task_result_type ec_type, int16_t ec_value)
     candidate.real_temp[calib_point] = calib_real;
     if (!validate_temp_calib(candidate, calib_point + 1))
     {
-        calib_message = "POINT GAP / SLOPE";
+        calib_message = "GAP/SLOPE";
         calib_dirty = true;
         return;
     }
@@ -821,16 +833,23 @@ void UI::calibration_tick(uint32_t now)
     if (running)
     {
         const TempSample sample = adc.snapshot();
-        if (sample.sequence != calib_window_sequence)
-            calib_window.observe(sample.raw_temp, sample.instant_temp, sample.sampled_at,
-                                 sample.sequence, sample.healthy, sample.ready, now);
-        const bool stable = sample.healthy && sample.ready &&
+        const bool eligible = sample.healthy && sample.ready &&
             static_cast<uint32_t>(now - sample.sampled_at) <= CalibStability::max_gap_ms &&
-            calib_window.stable(now);
+            calibration_near_target(calib_point, sample.raw_temp, sample.instant_temp);
+        if (!eligible)
+            calib_window.reset();
+        if (sample.sequence != calib_window_sequence)
+        {
+            if (eligible)
+                calib_window.observe(sample.raw_temp, sample.instant_temp, sample.sampled_at,
+                                     sample.sequence, sample.healthy, sample.ready, now);
+            calib_window_sequence = sample.sequence;
+        }
+        const bool stable = eligible && calib_window.stable(now);
         if (calib_state == CalibState::ENTER_VALUE && !stable)
         {
             calib_state = CalibState::WAIT_STABLE;
-            calib_message = "UNSTABLE: WAIT AGAIN";
+            calib_message = "UNSTABLE";
             calibration_reset_window();
         }
         else if (calib_state == CalibState::WAIT_STABLE && stable)
@@ -838,7 +857,7 @@ void UI::calibration_tick(uint32_t now)
             const float raw = calib_window.mean();
             if (calib_point == 0 && (raw < 10.0f || raw > 40.0f))
             {
-                calib_message = "COOL / CHECK SENSOR";
+                calib_message = "ROOM RANGE";
                 return;
             }
             calib_state = CalibState::ENTER_VALUE;
@@ -909,22 +928,35 @@ void UI::calibration_draw(short x, short y)
     else if (calib_state == CalibState::WAIT_STABLE || calib_state == CalibState::ENTER_VALUE)
     {
         const TempSample sample = adc.snapshot();
-        static const unsigned budget[] = {0, 15, 35, 60};
-        snprintf(line, sizeof(line), "P%u %u%% RAW %.1fC", calib_point, budget[calib_point],
-                 static_cast<double>(sample.raw_temp));
+        row3 = miot.miot_able && pwm.calibration_active() ?
+            "HOLD:STOP / NET PAUSE" : "HOLD: LOCAL STOP";
+        if (*calib_message)
+        {
+            if (calib_point == 0)
+                snprintf(line, sizeof(line), "P0 ROOM %s", calib_message);
+            else
+                snprintf(line, sizeof(line), "P%u %uC %s", calib_point,
+                         static_cast<unsigned>(calibration_target(calib_point)), calib_message);
+        }
+        else if (calib_point == 0)
+            snprintf(line, sizeof(line), "P0 ROOM / NO HEAT");
+        else
+            snprintf(line, sizeof(line), "P%u TARGET %uC", calib_point,
+                     static_cast<unsigned>(calibration_target(calib_point)));
         oled.str(x, y, line, 8, 1, 0);
+        snprintf(line, sizeof(line), "RAW %.1fC UNMAPPED", static_cast<double>(sample.raw_temp));
+        oled.str(x, y + 8, line, 8, 1, 0);
         if (calib_state == CalibState::ENTER_VALUE)
             snprintf(line, sizeof(line), "REF %uC CLICK: OK", calib_real);
+        else if (!calibration_near_target(calib_point, sample.raw_temp, sample.instant_temp))
+            snprintf(line, sizeof(line), "HEATING TO TARGET");
         else
         {
             unsigned seconds = calib_window.span_ms() / 1000;
             if (seconds > 30) seconds = 30;
             snprintf(line, sizeof(line), "WAIT STABLE %u/30s", seconds);
         }
-        oled.str(x, y + 8, line, 8, 1, 0);
-        row2 = *calib_message ? calib_message :
-            calib_point == 0 ? "ROOM REF / FIX SPOT" : "FIX SPOT / EXT REF";
-        oled.str(x, y + 16, row2, 8, 1, 0);
+        oled.str(x, y + 16, line, 8, 1, 0);
         oled.str(x, y + 24, row3, 8, 1, 0);
         return;
     }

@@ -18,11 +18,11 @@ private:
     bool held_;
 };
 
-uint8_t calibration_duty(uint8_t point)
+uint8_t calibration_limit(uint8_t bed_limit)
 {
-    constexpr float fractions[] = {0.0f, 0.15f, 0.35f, 0.60f};
     const float budget = fminf(1.0f, POWER_SUPPLY * BED_RESISTOR / (VIN * VIN));
-    return static_cast<uint8_t>(budget * fractions[point] * 255.0f);
+    const uint8_t supply_limit = static_cast<uint8_t>(std::floor(budget * 255.0f));
+    return bed_limit < supply_limit ? bed_limit : supply_limit;
 }
 }
 
@@ -276,6 +276,7 @@ bool PWM::start_calibration()
     ui.temp_time_switch_flg = false;
     pwm_buf_f = 0;
     ek[0] = ek[1] = ek[2] = 0;
+    calib_pid_.reset();
     const uint32_t now = millis();
     calib_stop_.store(0, std::memory_order_release);
     portENTER_CRITICAL(&calib_mux);
@@ -298,9 +299,14 @@ bool PWM::set_calibration_point(uint8_t point)
         calib_stop_.load(std::memory_order_acquire) == 0;
     if (allowed) {
         calib_status_.point = point;
+        calib_status_.duty = 0;
         calib_point_at_ = millis();
     }
     portEXIT_CRITICAL(&calib_mux);
+    if (allowed) {
+        calib_pid_.reset();
+        analogWrite(HEB_PIN, 0);
+    }
     return allowed;
 }
 
@@ -346,6 +352,7 @@ void PWM::calibration_tick()
         const CalibStop stop = static_cast<CalibStop>(
             calib_stop_.load(std::memory_order_acquire));
         if (stop != CalibStop::None) {
+            calib_pid_.reset();
             analogWrite(HEB_PIN, 0);
             analogWrite(FAN_PIN, FAN_PWM);
             status.active = false;
@@ -355,8 +362,9 @@ void PWM::calibration_tick()
             status.reason = stop;
             calib_cool_tracking_ = false;
         } else {
-            uint8_t duty = calibration_duty(status.point);
-            if (duty > BED_PWM_PUT) duty = BED_PWM_PUT;
+            const uint8_t duty = calib_pid_.update(calibration_target(status.point),
+                sample.instant_temp, sample.sampled_at, sample.sequence,
+                calibration_limit(BED_PWM_PUT));
             if (duty != status.duty) analogWrite(HEB_PIN, duty);
             status.duty = duty;
         }

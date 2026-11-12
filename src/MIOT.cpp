@@ -277,6 +277,9 @@ void MIOT::begin()
 
 void MIOT::run_task()
 {
+    // 校准时同步网络等待会阻塞主循环心跳；停热后自动恢复联网处理。
+    if (pwm.calibration_active())
+        return;
     if (miot_able && wifi_conect_flg)
     {
         Blinker.run();
