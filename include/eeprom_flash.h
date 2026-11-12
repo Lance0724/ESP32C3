@@ -3,6 +3,7 @@
 
 #include <EEPROM.h>
 #include <Arduino.h>
+#include "TempCalibration.h"
 
 
 
@@ -27,6 +28,8 @@
 #define adc_max_temp_low_add 2472 //设备读取最高温度低八位
 #define adc_max_temp_high_add 2473 //设备读取最高温度高八位
 
+constexpr int temp_calib_record_add = 2480;
+
 
 class eeprom_flash{
     public:
@@ -36,6 +39,7 @@ class eeprom_flash{
     void write(int add,uint8_t dat);//写一个字节
     uint8_t read(int add);//读一个字节
     void write_task();
+    bool save_calib_data(const TempCalibData &data);
     void write_str(int add,String str);//写字符串
 
     uint8_t write_flg = 0;

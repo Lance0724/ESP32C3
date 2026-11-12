@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "workflow": "new-feature",
+  "mode": "standard",
+  "mode_history": [
+    {
+      "mode": "standard",
+      "reason": "涉及持久化格式、加热安全边界及跨模块公共接口，按已批准阶段1计划实施"
+    }
+  ],
+  "phase": "execution",
+  "revision": 14,
+  "acceptance_ids": [
+    "AC-001",
+    "AC-002",
+    "AC-003",
+    "AC-004",
+    "AC-005",
+    "AC-006"
+  ],
+  "design_ids": [
+    "DES-001",
+    "DES-002",
+    "DES-003",
+    "DES-004",
+    "DES-005",
+    "DES-006"
+  ],
+  "gates": {
+    "requirements": "沿用已批准计划全部六项验收，硬件要求单列且不以编译替代",
+    "specification": "明确模块接口、输出所有权、存储与软件/硬件验证边界",
+    "planning": "代码实现与软件验证有明确接口和文件所有权；实物验收独立记录"
+  },
+  "blocker": null,
+  "tasks": [
+    {
+      "id": "TASK-001",
+      "title": "实现阶段1全部固件路径",
+      "design_refs": [
+        "DES-001",
+        "DES-002",
+        "DES-003",
+        "DES-004",
+        "DES-005"
+      ],
+      "acceptance_refs": [
+        "AC-001",
+        "AC-002",
+        "AC-003",
+        "AC-004",
+        "AC-005"
+      ],
+      "depends_on": [],
+      "scope": [
+        "src/main.cpp",
+        "include/ADC.h",
+        "src/ADC.cpp",
+        "include/TempCalibration.h",
+        "src/TempCalibration.cpp",
+        "include/eeprom_flash.h",
+        "src/eeprom_flash.cpp",
+        "include/PWM.h",
+        "src/PWM.cpp",
+        "src/MIOT.cpp",
+        "include/ui.h",
+        "src/ui.cpp",
+        "include/EC11.h",
+        "include/CalibStability.h"
+      ],
+      "completion_criteria": "数据、输出安全与菜单真实路径完整接入，旧路径移除，定向主机验证与固件编译通过；硬件部分不冒充已验证",
+      "verification_plan": "全部编辑后统一运行实际实现的主机数值、状态与故障注入，并编译ESP32固件",
+      "status": "completed",
+      "reason": null,
+      "verification": {
+        "result": "passed",
+        "command": "python test/host/run.py; C:/Users/lance/.platformio/penv/Scripts/pio.exe run -e esp32-c3-devkitm-1",
+        "observed": "实际ADC/PWM/EEPROM/UI/MIOT路径的主机行为检查全部通过：插值/量化、176种单比特损坏、采样健康、Flash失败与读回损坏、稳定窗口、所有时限/回绕、远程互斥、四点流程、失稳拒绝、停热后保存及队列满长按终止。ESP32-C3固件构建SUCCESS；RAM 50412/327680字节，Flash 1251914/1310720字节。实物时限/电流/OLED/精度未验证。",
+        "evidence_refs": [
+          "test/host/calibration_test.cpp",
+          "EC11与温度标定_PLAN.md#操作与实现约定"
+        ]
+      }
+    },
+    {
+      "id": "TASK-002",
+      "title": "完成固件集成与定向软件验证",
+      "design_refs": [
+        "DES-001",
+        "DES-002",
+        "DES-003",
+        "DES-004",
+        "DES-005",
+        "DES-006"
+      ],
+      "acceptance_refs": [
+        "AC-001",
+        "AC-002",
+        "AC-003",
+        "AC-004",
+        "AC-005"
+      ],
+      "depends_on": [
+        "TASK-001"
+      ],
+      "scope": [
+        "test",
+        "platformio.ini",
+        ".ai/doc/ec11-temperature-calibration"
+      ],
+      "completion_criteria": "主机侧行为与故障检查及实际固件编译有证据，不将模拟等同实物",
+      "verification_plan": "运行定向主机验证程序、pio run -e esp32-c3-devkitm-1，并记录实际结果",
+      "status": "completed",
+      "reason": null,
+      "verification": {
+        "result": "passed",
+        "command": "python test/host/run.py; pio run -e esp32-c3-devkitm-1; pio device list --json-output",
+        "observed": "集成主机行为检查及固件编译均实际通过；主机输出四行成功页文本，仅为模拟显示，不代表物理OLED。编译仍有既有upload配置选项、Blinker及其依赖警告，未扩大范围处理。设备枚举为空数组，没有烧录或加热。批准计划已补充操作、测试命令、浮点容差与Arduino宏边界；实物验收在TASK-003独立阻塞。",
+        "evidence_refs": [
+          "test/host/run.py",
+          "EC11与温度标定_PLAN.md"
+        ]
+      }
+    },
+    {
+      "id": "TASK-003",
+      "title": "完成无负载波形与受限通电验收",
+      "design_refs": [
+        "DES-006"
+      ],
+      "acceptance_refs": [
+        "AC-001",
+        "AC-002",
+        "AC-003",
+        "AC-004",
+        "AC-005",
+        "AC-006"
+      ],
+      "depends_on": [
+        "TASK-002"
+      ],
+      "scope": [
+        "实物ESP32-C3与热床/供电/测量仪器"
+      ],
+      "completion_criteria": "独立保护和匹配电源下完成波形时限、电流、测温及恒温回流场景，具备实测记录",
+      "verification_plan": "根目录计划AC1至AC6所列真实仪器与通电场景，禁止自动烧录或无保护加热",
+      "status": "blocked",
+      "reason": "pio device list --json-output 返回空数组；未取得实物HEB/FAN波形、电源/冷阻/独立过温断电及参考测温条件。需连接实物并确认独立保护后完成计划AC1至AC6实测，不以主机模拟或编译代替。",
+      "verification": {
+        "result": "not_run",
+        "command": null,
+        "observed": null,
+        "evidence_refs": []
+      }
+    }
+  ]
+}

@@ -1,4 +1,30 @@
 #include "PWM.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <cmath>
+
+namespace {
+StaticSemaphore_t output_mutex_storage;
+SemaphoreHandle_t output_mutex;
+portMUX_TYPE calib_mux = portMUX_INITIALIZER_UNLOCKED;
+
+class OutputGuard {
+public:
+    explicit OutputGuard(TickType_t wait = portMAX_DELAY)
+        : held_(xSemaphoreTake(output_mutex, wait) == pdTRUE) {}
+    ~OutputGuard() { if (held_) xSemaphoreGive(output_mutex); }
+    explicit operator bool() const { return held_; }
+private:
+    bool held_;
+};
+
+uint8_t calibration_duty(uint8_t point)
+{
+    constexpr float fractions[] = {0.0f, 0.15f, 0.35f, 0.60f};
+    const float budget = fminf(1.0f, POWER_SUPPLY * BED_RESISTOR / (VIN * VIN));
+    return static_cast<uint8_t>(budget * fractions[point] * 255.0f);
+}
+}
 
 
 Ticker pwm_tic;
@@ -9,6 +35,7 @@ int16_t ek[3] = {0, 0, 0};
 
 PWM::PWM()
 {
+    output_mutex = xSemaphoreCreateMutexStatic(&output_mutex_storage);
     //pinMode(HEB_PIN, OUTPUT);
     //pinMode(FAN_PIN, OUTPUT);
     pinMode(LEDP_IN, OUTPUT);
@@ -20,6 +47,13 @@ PWM::PWM()
 
 void pwm_irq()
 {
+    // 输出互斥锁不阻塞共享定时线程，防止旧普通回调越过停热重新输出。
+    OutputGuard output(0);
+    if (!output) return;
+    if (pwm.calibration_locked()) {
+        pwm.calibration_tick();
+        return;
+    }
     count++;
     if (!count && pwm.high_time){
         analogWrite(HEB_PIN, pwm.BED_PWM_PUT);
@@ -39,6 +73,8 @@ void pwm_irq()
 
 void PWM::begin()
 {
+    OutputGuard output;
+    if (calibration_locked()) return;
     if (temp_mode == Co_Temp)
         temp_time_buf = temp_mode1_time;
     else
@@ -60,6 +96,11 @@ void PWM::begin()
 }
 void PWM::end()
 {
+    OutputGuard output;
+    if (calibration_locked()) {
+        request_calibration_stop(CalibStop::Cancelled);
+        return;
+    }
     pwm_tic.detach();
     high_time = 0;
     analogWrite(HEB_PIN, 0);
@@ -154,20 +195,194 @@ void PWM::temp_set()
 
 
 //---------fan 控制---------
-void PWM::fan(){   //风扇开启
-    
-    fan_state = !fan_state;    
+void PWM::fan()
+{
+    OutputGuard output;
+    if (!calibration_locked()) fan_state = !fan_state;
 }
-void PWM::fan_time(){  //风扇自动化
-    if (adc.now_temp > 50){
-        if (fan_state){
-         analogWrite(FAN_PIN, 200);
-        }else{
-            analogWrite(FAN_PIN, 84);//
-        }
+
+void PWM::fan_time()
+{
+    OutputGuard output;
+    if (calibration_locked()) return;
+    if (adc.now_temp > 50) {
+        analogWrite(FAN_PIN, fan_state ? 200 : 84);
     } else {
         analogWrite(FAN_PIN, 0);
         fan_state = 0;
     }
+}
+
+CalibStatus PWM::calibration_status() const
+{
+    portENTER_CRITICAL(&calib_mux);
+    const CalibStatus status = calib_status_;
+    portEXIT_CRITICAL(&calib_mux);
+    return status;
+}
+
+bool PWM::calibration_locked() const
+{
+    const CalibStatus status = calibration_status();
+    return status.active || status.cooling;
+}
+
+bool PWM::calibration_active() const
+{
+    return calibration_status().active;
+}
+
+bool PWM::calibration_can_save() const
+{
+    const CalibStatus status = calibration_status();
+    return status.stopped && !status.active && status.duty == 0 &&
+        status.reason == CalibStop::Completed &&
+        calib_stop_.load(std::memory_order_acquire) ==
+            static_cast<uint32_t>(CalibStop::Completed);
+}
+
+void PWM::request_calibration_stop(CalibStop reason)
+{
+    if (reason == CalibStop::None) return;
+    uint32_t previous = calib_stop_.load(std::memory_order_relaxed);
+    const uint32_t requested = static_cast<uint32_t>(reason);
+    // 完成不能覆盖取消/故障；完成请求在实际提交前仍可被终止抢占。
+    while (previous == 0 || previous == static_cast<uint32_t>(CalibStop::Completed)) {
+        if (calib_stop_.compare_exchange_weak(previous, requested,
+                std::memory_order_release, std::memory_order_relaxed)) break;
+    }
+}
+
+bool PWM::start_calibration()
+{
+    OutputGuard output;
+    const TempSample sample = adc.snapshot();
+    if (power || backflow_working_state != 0 || calibration_locked() ||
+        !sample.ready || !sample.healthy ||
+        static_cast<uint32_t>(millis() - sample.sampled_at) > 1500 ||
+        sample.raw_temp < 10 || sample.raw_temp > 40 ||
+        sample.instant_temp < 10 || sample.instant_temp > 40) return false;
+
+    pwm_tic.detach();
+    analogWrite(HEB_PIN, 0);
+    analogWrite(FAN_PIN, 0);
+    high_time = 0;
+    count = 0;
+    power = 0;
+    backflow_working_state = 0;
+    temp_reached_flg = false;
+    temp_time_buf = 0;
+    min_count = 0;
+    ui.temp_time_switch_flg = false;
+    pwm_buf_f = 0;
+    ek[0] = ek[1] = ek[2] = 0;
+    const uint32_t now = millis();
+    calib_stop_.store(0, std::memory_order_release);
+    portENTER_CRITICAL(&calib_mux);
+    calib_status_ = CalibStatus{};
+    calib_status_.active = true;
+    calib_heartbeat_at_ = calib_point_at_ = calib_session_at_ = now;
+    calib_cool_tracking_ = false;
+    portEXIT_CRITICAL(&calib_mux);
+    pwm_tic.attach_ms(4, pwm_irq);
+    return true;
+}
+
+bool PWM::set_calibration_point(uint8_t point)
+{
+    if (point >= CALIB_POINT_NUM) return false;
+    OutputGuard output;
+    portENTER_CRITICAL(&calib_mux);
+    const bool allowed = calib_status_.active &&
+        point == static_cast<uint8_t>(calib_status_.point + 1) &&
+        calib_stop_.load(std::memory_order_acquire) == 0;
+    if (allowed) {
+        calib_status_.point = point;
+        calib_point_at_ = millis();
+    }
+    portEXIT_CRITICAL(&calib_mux);
+    return allowed;
+}
+
+void PWM::calibration_heartbeat()
+{
+    portENTER_CRITICAL(&calib_mux);
+    if (calib_status_.active) calib_heartbeat_at_ = millis();
+    portEXIT_CRITICAL(&calib_mux);
+}
+
+void PWM::calibration_tick()
+{
+    // 仅由持有输出互斥锁的PWM回调调用；临界区内不执行外设操作。
+    CalibStatus status = calibration_status();
+    const uint32_t now = millis();
+    const TempSample sample = adc.snapshot();
+    if (status.active) {
+        uint32_t heartbeat_at, point_at, session_at;
+        portENTER_CRITICAL(&calib_mux);
+        heartbeat_at = calib_heartbeat_at_;
+        point_at = calib_point_at_;
+        session_at = calib_session_at_;
+        portEXIT_CRITICAL(&calib_mux);
+
+        CalibStop fault = CalibStop::None;
+        if (!sample.ready || !sample.healthy) fault = CalibStop::Sensor;
+        else if (static_cast<uint32_t>(now - sample.sampled_at) > 2500)
+            fault = CalibStop::SampleTimeout;
+        else if (!std::isfinite(sample.instant_temp) || !std::isfinite(sample.raw_temp) ||
+                 !std::isfinite(sample.calibrated_temp))
+            fault = CalibStop::Sensor;
+        else if (sample.instant_temp >= 230 || sample.raw_temp >= 230 ||
+                 sample.calibrated_temp >= 230)
+            fault = CalibStop::OverTemp;
+        else if (static_cast<uint32_t>(now - heartbeat_at) > 250)
+            fault = CalibStop::HeartbeatTimeout;
+        else if (static_cast<uint32_t>(now - session_at) >= 1800000)
+            fault = CalibStop::SessionTimeout;
+        else if (static_cast<uint32_t>(now - point_at) >= 600000)
+            fault = CalibStop::PointTimeout;
+        if (fault != CalibStop::None) request_calibration_stop(fault);
+
+        const CalibStop stop = static_cast<CalibStop>(
+            calib_stop_.load(std::memory_order_acquire));
+        if (stop != CalibStop::None) {
+            analogWrite(HEB_PIN, 0);
+            analogWrite(FAN_PIN, FAN_PWM);
+            status.active = false;
+            status.cooling = true;
+            status.stopped = true;
+            status.duty = 0;
+            status.reason = stop;
+            calib_cool_tracking_ = false;
+        } else {
+            uint8_t duty = calibration_duty(status.point);
+            if (duty > BED_PWM_PUT) duty = BED_PWM_PUT;
+            if (duty != status.duty) analogWrite(HEB_PIN, duty);
+            status.duty = duty;
+        }
+    } else if (status.cooling) {
+        const CalibStop stop = static_cast<CalibStop>(
+            calib_stop_.load(std::memory_order_acquire));
+        if (status.reason == CalibStop::Completed && stop != CalibStop::None)
+            status.reason = stop;
+        const bool cool = sample.ready && sample.healthy &&
+            static_cast<uint32_t>(now - sample.sampled_at) <= 2500 &&
+            std::isfinite(sample.raw_temp) && std::isfinite(sample.calibrated_temp) &&
+            sample.raw_temp < 50 && sample.calibrated_temp < 50;
+        if (!cool) {
+            calib_cool_tracking_ = false;
+        } else if (!calib_cool_tracking_) {
+            calib_cool_at_ = now;
+            calib_cool_tracking_ = true;
+        } else if (static_cast<uint32_t>(now - calib_cool_at_) >= 10000) {
+            analogWrite(FAN_PIN, 0);
+            fan_state = 0;
+            status.cooling = false;
+            pwm_tic.detach();
+        }
+    }
+    portENTER_CRITICAL(&calib_mux);
+    calib_status_ = status;
+    portEXIT_CRITICAL(&calib_mux);
 }
 

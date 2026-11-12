@@ -76,6 +76,9 @@ public:
     //双击识别是否启用 val:true/false 默认开启true
     void double_click(bool val);
 
+    bool speed_up_enabled() const { return speed_up_flg; }
+    bool double_click_enabled() const { return double_click_count == key_double_out; }
+
     /*
         回调函数触发任务后，用于获取按键输入类型，回调函数结束后将清零
         sw_click,   //单击

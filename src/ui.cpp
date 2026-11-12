@@ -1,5 +1,80 @@
 #include "User.h"
 #include "bmp.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <stdio.h>
+
+namespace
+{
+struct KeyEvent
+{
+    ec11_task_result_type type;
+    int16_t value;
+    uint32_t at;
+    uint32_t generation;
+};
+constexpr uint8_t key_queue_capacity = 32;
+KeyEvent key_queue[key_queue_capacity];
+portMUX_TYPE key_mux = portMUX_INITIALIZER_UNLOCKED;
+uint8_t key_head = 0;
+uint8_t key_count = 0;
+uint32_t key_generation = 0;
+bool calib_page_armed = false;
+bool calib_stop_armed = false;
+bool calib_exit_requested = false;
+
+void key_lock(bool isr)
+{
+    if (isr) {
+        portENTER_CRITICAL_ISR(&key_mux);
+    } else {
+        portENTER_CRITICAL(&key_mux);
+    }
+}
+
+void key_unlock(bool isr)
+{
+    if (isr) {
+        portEXIT_CRITICAL_ISR(&key_mux);
+    } else {
+        portEXIT_CRITICAL(&key_mux);
+    }
+}
+
+void discard_keys()
+{
+    key_lock(false);
+    key_head = 0;
+    key_count = 0;
+    ++key_generation;
+    key_unlock(false);
+}
+
+bool take_calib_exit()
+{
+    key_lock(false);
+    const bool requested = calib_exit_requested;
+    calib_exit_requested = false;
+    key_unlock(false);
+    return requested;
+}
+
+const char *calib_stop_text(CalibStop reason)
+{
+    switch (reason)
+    {
+    case CalibStop::Cancelled: return "CANCELLED";
+    case CalibStop::RemoteOff: return "REMOTE OFF";
+    case CalibStop::Sensor: return "SENSOR ERROR";
+    case CalibStop::OverTemp: return "OVER TEMPERATURE";
+    case CalibStop::SampleTimeout: return "SAMPLE TIMEOUT";
+    case CalibStop::HeartbeatTimeout: return "UI TIMEOUT";
+    case CalibStop::PointTimeout: return "POINT TIMEOUT";
+    case CalibStop::SessionTimeout: return "SESSION TIMEOUT";
+    default: return "STOPPED";
+    }
+}
+}
 UI ui;
 
 #define page2_menu_num_max 8
@@ -64,17 +139,36 @@ const char menu5_option0_0[] = {"这么简单自己摸索"};
 const char menu6_option0_0[] = {"启凡科创智能加热台"};
 const char menu6_option0_1[] = {"Version:V1.5"};
 
-const char menu7_option0_0[] = {"实测最高"};
-const char menu7_option0_1[] = {"校准温度"};
-const char menu7_option0_2[] = {":   `"};
-const char menu7_option0_3[] = {"校准结束后将"};
-const char menu7_option0_4[] = {"自动返回"};
+// 校准页使用四行小字，避免三十二像素屏幕裁切关键提示。
 
 /************************/
 
 void UI::run_task()
 {
 
+    consume_key_events();
+    calibration_tick(millis());
+    if (calib_state != CalibState::IDLE)
+    {
+        oled_sleep_t = 0;
+        wake_sleep_change_flg = 0;
+        if (oled_sleep_flg)
+        {
+            oled.display_on();
+            oled_sleep_flg = false;
+        }
+        const uint32_t now = millis();
+        if (calib_dirty || static_cast<uint32_t>(now - calib_draw_at) >= 200)
+        {
+            calib_draw_at = now;
+            calib_dirty = false;
+            oled.clr();
+            oled.xy_set(0, 0, 128, 4);
+            calibration_draw(0, 0);
+            oled.refresh();
+        }
+        return;
+    }
     wake_sleep_page();
 
     if (oled_sleep_flg)
@@ -99,7 +193,6 @@ void UI::run_task()
     case 3:
         page3_switch();
         blinker_config();
-        error_temp_fix_page_move();
         break;
     }
     
@@ -204,6 +297,11 @@ void UI::page2_key(ec11_task_result_type ec_type, int16_t ec_value) //界面2按
         {
 
         case sw_long:
+            if (page2_menu_num == error_temp_fix_num)
+            {
+                calibration_enter();
+                return;
+            }
             switch_buf = sure;
             page_switch_flg = 1;
             if (page2_menu_num == constant_temperature_menu_num || page2_menu_num == oled_light_menu_num || page2_menu_num == backflow_menu_num)
@@ -233,6 +331,11 @@ void UI::page2_key(ec11_task_result_type ec_type, int16_t ec_value) //界面2按
 
 void UI::page3_key(ec11_task_result_type ec_type, int16_t ec_value) //界面3按键对应功能
 {
+    if (page2_menu_num == error_temp_fix_num)
+    {
+        calibration_key(ec_type, ec_value);
+        return;
+    }
     if (ec_type == ec11_task_is_key)
     {
         if (ec_value == sw_click) //单击
@@ -263,29 +366,6 @@ void UI::page3_key(ec11_task_result_type ec_type, int16_t ec_value) //界面3按
                     }
                 }
             }
-            if (page2_menu_num == error_temp_fix_num)
-            {
-                switch (error_temp_fix_page_buf)
-                {
-                case 0:
-                    error_temp_fix_page_buf = 1;
-                    break;
-                case 1:
-                    error_temp_fix_page_buf = 0;
-                    break;
-                case 2:
-                    if (pwm.power == 0 && adc.now_temp < 150)
-                    {
-                        error_temp_fix_page_buf = 3;
-                        error_temp_fix_page_move_buf = 2;
-                    }
-                    break;
-                default:
-                    error_temp_fix_page_buf = 2;
-                    error_temp_fix_page_move_buf = 2;
-                    break;
-                }
-            }
         }
         else
         {
@@ -295,15 +375,11 @@ void UI::page3_key(ec11_task_result_type ec_type, int16_t ec_value) //界面3按
             }
             else
             {
-                if (error_temp_fix_page_buf == 1)
-                    error_temp_fix_page_buf = 0;
-                if (error_temp_fix_page_buf == 3)
-                    error_temp_fix_page_buf = 2;
 
                 switch_buf = 0;
                 page_switch_flg = 1;
                 ec11.speed_up(false);
-                if (page2_menu_num < 6 || page2_menu_num == error_temp_fix_num)
+                if (page2_menu_num < 6)
                     eeprom.write_flg = 1;
                 ec11.double_click(true);
 
@@ -393,35 +469,6 @@ void UI::page3_key(ec11_task_result_type ec_type, int16_t ec_value) //界面3按
                 oled_light = 255;
             write_oled_flg = 1;
             break;
-        case error_temp_fix_num: //温度校准
-            switch (error_temp_fix_page_buf)
-            {
-            case 0:
-                if (ec_value > 0)
-                {
-                    error_temp_fix_page_buf = 2;
-                    error_temp_fix_page_move_buf = 1;
-                }
-                break;
-            case 1:
-            {
-                adc.hotbed_max_temp += ec_value;
-                if (adc.hotbed_max_temp < 240)
-                    adc.hotbed_max_temp = 240;
-                else if (adc.hotbed_max_temp > 270)
-                    adc.hotbed_max_temp = 270;
-            }
-            break;
-            case 2:
-                if (ec_value < 0)
-                {
-                    error_temp_fix_page_buf = 0;
-                    error_temp_fix_page_move_buf = 1;
-                }
-                break;
-            default:
-                break;
-            }
         default:
             break;
         }
@@ -486,24 +533,428 @@ bool UI::oled_display_set()
     }
 }
 
-void ui_key_callb(ec11_task_result_type ec_type, int16_t ec_value) //按键事件中断处理
+void ui_key_callb(ec11_task_result_type ec_type, int16_t ec_value) // 中断与定时任务只提交事件。
 {
-    if (ui.oled_display_set())
-        return;
+    ui.enqueue_key_event(ec_type, ec_value);
+}
 
+void UI::enqueue_key_event(ec11_task_result_type ec_type, int16_t ec_value)
+{
+    const bool isr = xPortInIsrContext();
+    const uint32_t now = millis();
+    key_lock(isr);
+    const bool long_press = ec_type == ec11_task_is_key && ec_value == sw_long;
+    const bool stop = long_press && calib_stop_armed;
+    if (long_press && calib_page_armed)
+        calib_exit_requested = true;
+    if (key_count < key_queue_capacity)
+    {
+        key_queue[(key_head + key_count) % key_queue_capacity] =
+            {ec_type, ec_value, now, key_generation};
+        ++key_count;
+    }
+    key_unlock(isr);
+    // 独立停止请求不依赖普通队列容量，也不触碰显示或输出引脚。
+    if (stop)
+        pwm.request_calibration_stop(CalibStop::Cancelled);
+}
+
+void UI::consume_key_events()
+{
+    if (take_calib_exit())
+    {
+        if (calib_state != CalibState::IDLE)
+            calibration_exit();
+        return;
+    }
+    for (uint8_t i = 0; i < key_queue_capacity; ++i)
+    {
+        key_lock(false);
+        if (!key_count)
+        {
+            key_unlock(false);
+            break;
+        }
+        const KeyEvent event = key_queue[key_head];
+        key_head = (key_head + 1) % key_queue_capacity;
+        --key_count;
+        const uint32_t generation = key_generation;
+        key_unlock(false);
+        if (take_calib_exit())
+        {
+            if (calib_state != CalibState::IDLE)
+                calibration_exit();
+            break;
+        }
+        if (event.generation != generation)
+            continue;
+        if (calib_state == CalibState::ENTER_VALUE &&
+            static_cast<int32_t>(event.at - calib_input_after) <= 0)
+            continue;
+        // 输入前也更新快照，失稳时立即废弃尚未处理的录入事件。
+        calibration_tick(millis());
+        key_lock(false);
+        const bool current = event.generation == key_generation;
+        key_unlock(false);
+        if (current)
+            process_key_event(event.type, event.value);
+    }
+}
+
+void UI::process_key_event(ec11_task_result_type ec_type, int16_t ec_value)
+{
+    if (calib_state != CalibState::IDLE)
+    {
+        calibration_key(ec_type, ec_value);
+        return;
+    }
+    if (oled_display_set())
+        return;
     switch (page_num)
     {
-    case 1:
-        ui.page1_key(ec_type, ec_value);
-        break;
-    case 2:
-        ui.page2_key(ec_type, ec_value);
-        break;
-    case 3:
-        ui.page3_key(ec_type, ec_value);
-        break;
+    case 1: page1_key(ec_type, ec_value); break;
+    case 2: page2_key(ec_type, ec_value); break;
+    case 3: page3_key(ec_type, ec_value); break;
     }
     eeprom.write_t = 0;
+}
+
+void UI::calibration_enter()
+{
+    calib_previous_speed = ec11.speed_up_enabled();
+    calib_previous_double = ec11.double_click_enabled();
+    ec11.speed_up(false);
+    ec11.double_click(false);
+    calib_state = CalibState::CONFIRM;
+    calib_candidate = {};
+    calib_point = 0;
+    calib_message = "";
+    calib_save_banner = false;
+    calib_dirty = true;
+    page_num = 3;
+    page_switch_flg = false;
+    page3_switch_flg = 0;
+    page2_move_flg = 0;
+    page2_move_tmp = 0;
+    key_lock(false);
+    calib_page_armed = true;
+    calib_stop_armed = false;
+    calib_exit_requested = false;
+    key_head = key_count = 0;
+    ++key_generation;
+    key_unlock(false);
+}
+
+void UI::calibration_exit()
+{
+    key_lock(false);
+    const bool stop = calib_stop_armed;
+    calib_page_armed = false;
+    calib_stop_armed = false;
+    calib_exit_requested = false;
+    key_head = key_count = 0;
+    ++key_generation;
+    key_unlock(false);
+    if (stop)
+        pwm.request_calibration_stop(CalibStop::Cancelled);
+    calib_candidate = {};
+    calib_window.reset();
+    calib_state = CalibState::IDLE;
+    ec11.speed_up(calib_previous_speed);
+    ec11.double_click(calib_previous_double);
+    page_num = 2;
+    page_switch_flg = false;
+    oled_flg = 1;
+    // 返回菜单不写普通参数，也不恢复先前的加热任务。
+}
+
+void UI::calibration_reset_window()
+{
+    calib_window.reset();
+    calib_window_sequence = adc.snapshot().sequence;
+    calib_input_after = millis();
+    discard_keys();
+    calib_real = 0;
+    calib_dirty = true;
+}
+
+void UI::calibration_abort(const char *message)
+{
+    calib_candidate = {};
+    calib_window.reset();
+    calib_state = CalibState::ABORT;
+    calib_message = message;
+    calib_dirty = true;
+    discard_keys();
+}
+
+void UI::calibration_key(ec11_task_result_type ec_type, int16_t ec_value)
+{
+    if (ec_type == ec11_task_is_key && ec_value == sw_long)
+    {
+        calibration_exit();
+        return;
+    }
+    if (ec_type == ec11_task_is_encode)
+    {
+        if (calib_state == CalibState::ENTER_VALUE)
+        {
+            // 校准页按方向每次一摄氏度，不继承进入前残留的加速计数。
+            const int value = static_cast<int>(calib_real) + (ec_value > 0 ? 1 : ec_value < 0 ? -1 : 0);
+            calib_real = value < 0 ? 0 : value > 230 ? 230 : value;
+            calib_message = "";
+            calib_dirty = true;
+        }
+        return;
+    }
+    if (ec_type != ec11_task_is_key || ec_value != sw_click)
+        return;
+    if (calib_state == CalibState::ABORT)
+    {
+        calibration_exit();
+        return;
+    }
+    if (calib_state == CalibState::CONFIRM)
+    {
+        const TempSample sample = adc.snapshot();
+        if (pwm.power || pwm.calibration_locked())
+            calib_message = "BUSY / COOLING";
+        else if (!sample.ready || !sample.healthy || !isfinite(sample.raw_temp) ||
+                 static_cast<uint32_t>(millis() - sample.sampled_at) > CalibStability::max_gap_ms)
+            calib_message = "WAIT HEALTHY SENSOR";
+        else if (sample.raw_temp < 10.0f || sample.raw_temp > 40.0f)
+            calib_message = "COOL TO 10..40C";
+        else
+        {
+            key_lock(false);
+            calib_stop_armed = true;
+            key_unlock(false);
+            if (pwm.start_calibration())
+            {
+                calib_candidate = {};
+                calib_point = 0;
+                calib_state = CalibState::WAIT_STABLE;
+                calib_message = "";
+                calibration_reset_window();
+            }
+            else
+            {
+                key_lock(false);
+                calib_stop_armed = false;
+                key_unlock(false);
+                calib_message = "START REFUSED";
+            }
+        }
+        calib_dirty = true;
+        return;
+    }
+    if (calib_state != CalibState::ENTER_VALUE)
+        return;
+    const uint32_t now = millis();
+    calibration_tick(now);
+    if (calib_state != CalibState::ENTER_VALUE || !calib_window.stable(now))
+        return;
+    const float raw = calib_window.mean();
+    if (calib_point == 0 &&
+        (raw < 10.0f || raw > 40.0f || calib_real < 10 || calib_real > 40 ||
+         fabsf(raw - static_cast<float>(calib_real)) > 10.0f))
+    {
+        calib_message = "P0 ROOM / CHECK REF";
+        calib_dirty = true;
+        return;
+    }
+    TempCalibData candidate = calib_candidate;
+    candidate.raw_temp[calib_point] = raw;
+    candidate.real_temp[calib_point] = calib_real;
+    if (!validate_temp_calib(candidate, calib_point + 1))
+    {
+        calib_message = "POINT GAP / SLOPE";
+        calib_dirty = true;
+        return;
+    }
+    calib_candidate = candidate;
+    if (++calib_point == CALIB_POINT_NUM)
+    {
+        // 完成仅是停止请求；实际输出已归零之前绝不允许提交闪存。
+        pwm.request_calibration_stop(CalibStop::Completed);
+        calib_state = CalibState::SAVING;
+        calib_save_banner = false;
+        calib_dirty = true;
+        discard_keys();
+    }
+    else if (pwm.set_calibration_point(calib_point))
+    {
+        calib_state = CalibState::WAIT_STABLE;
+        calib_message = "";
+        calibration_reset_window();
+    }
+    else
+    {
+        pwm.request_calibration_stop(CalibStop::Cancelled);
+        calibration_abort("POINT REQUEST FAILED");
+    }
+}
+
+void UI::calibration_tick(uint32_t now)
+{
+    if (calib_state == CalibState::IDLE)
+        return;
+    if (take_calib_exit())
+    {
+        calibration_exit();
+        return;
+    }
+    pwm.calibration_heartbeat();
+    const CalibStatus status = pwm.calibration_status();
+    const bool running = calib_state == CalibState::WAIT_STABLE || calib_state == CalibState::ENTER_VALUE;
+    if ((running || calib_state == CalibState::SAVING) &&
+        status.reason != CalibStop::None && status.reason != CalibStop::Completed)
+    {
+        calibration_abort(calib_stop_text(status.reason));
+        return;
+    }
+    if (running && !status.active)
+    {
+        calibration_abort("SESSION STOPPED");
+        return;
+    }
+    if (running)
+    {
+        const TempSample sample = adc.snapshot();
+        if (sample.sequence != calib_window_sequence)
+            calib_window.observe(sample.raw_temp, sample.instant_temp, sample.sampled_at,
+                                 sample.sequence, sample.healthy, sample.ready, now);
+        const bool stable = sample.healthy && sample.ready &&
+            static_cast<uint32_t>(now - sample.sampled_at) <= CalibStability::max_gap_ms &&
+            calib_window.stable(now);
+        if (calib_state == CalibState::ENTER_VALUE && !stable)
+        {
+            calib_state = CalibState::WAIT_STABLE;
+            calib_message = "UNSTABLE: WAIT AGAIN";
+            calibration_reset_window();
+        }
+        else if (calib_state == CalibState::WAIT_STABLE && stable)
+        {
+            const float raw = calib_window.mean();
+            if (calib_point == 0 && (raw < 10.0f || raw > 40.0f))
+            {
+                calib_message = "COOL / CHECK SENSOR";
+                return;
+            }
+            calib_state = CalibState::ENTER_VALUE;
+            calib_real = static_cast<uint16_t>(raw < 0 ? 0 : raw > 230 ? 230 : raw + 0.5f);
+            calib_message = "";
+            calib_input_after = now;
+            discard_keys();
+            calib_dirty = true;
+        }
+    }
+    else if (calib_state == CalibState::SAVING && pwm.calibration_can_save())
+    {
+        if (!validate_temp_calib(calib_candidate))
+        {
+            calibration_abort("MODEL INVALID");
+            return;
+        }
+        if (!calib_save_banner)
+        {
+            calib_dirty = true;
+            return;
+        }
+        if (take_calib_exit())
+        {
+            calibration_exit();
+            return;
+        }
+        if (!pwm.calibration_can_save())
+            return;
+        // 同步保存已经开始后不可撤销；中途长按只退出显示，不声称回滚。
+        const bool saved = eeprom.save_calib_data(calib_candidate);
+        if (take_calib_exit())
+        {
+            calibration_exit();
+            return;
+        }
+        key_lock(false);
+        calib_stop_armed = false;
+        key_unlock(false);
+        if (saved)
+        {
+            calib_state = CalibState::SUCCESS;
+            calib_success_at = millis();
+            calib_dirty = true;
+            discard_keys();
+        }
+        else
+            calibration_abort("FLASH SAVE FAILED");
+    }
+    else if (calib_state == CalibState::SUCCESS &&
+             static_cast<uint32_t>(now - calib_success_at) >= 2000)
+        calibration_exit();
+}
+
+void UI::calibration_draw(short x, short y)
+{
+    char line[22];
+    const char *row0 = "";
+    const char *row1 = "";
+    const char *row2 = "";
+    const char *row3 = "HOLD: CANCEL";
+    if (calib_state == CalibState::CONFIRM)
+    {
+        row0 = "START CALIB?";
+        row1 = "COLD 10..40C / REF";
+        row2 = *calib_message ? calib_message : "FIX SPOT / CLICK GO";
+    }
+    else if (calib_state == CalibState::WAIT_STABLE || calib_state == CalibState::ENTER_VALUE)
+    {
+        const TempSample sample = adc.snapshot();
+        static const unsigned budget[] = {0, 15, 35, 60};
+        snprintf(line, sizeof(line), "P%u %u%% RAW %.1fC", calib_point, budget[calib_point],
+                 static_cast<double>(sample.raw_temp));
+        oled.str(x, y, line, 8, 1, 0);
+        if (calib_state == CalibState::ENTER_VALUE)
+            snprintf(line, sizeof(line), "REF %uC CLICK: OK", calib_real);
+        else
+        {
+            unsigned seconds = calib_window.span_ms() / 1000;
+            if (seconds > 30) seconds = 30;
+            snprintf(line, sizeof(line), "WAIT STABLE %u/30s", seconds);
+        }
+        oled.str(x, y + 8, line, 8, 1, 0);
+        row2 = *calib_message ? calib_message :
+            calib_point == 0 ? "ROOM REF / FIX SPOT" : "FIX SPOT / EXT REF";
+        oled.str(x, y + 16, row2, 8, 1, 0);
+        oled.str(x, y + 24, row3, 8, 1, 0);
+        return;
+    }
+    else if (calib_state == CalibState::SAVING)
+    {
+        if (pwm.calibration_can_save())
+            calib_save_banner = true;
+        row0 = calib_save_banner ? "SAVING..." : "STOPPING HEAT...";
+        row1 = "FLASH CANNOT UNDO";
+        row2 = "HOLD: EXIT DISPLAY";
+        row3 = "FAN: COOLING";
+    }
+    else if (calib_state == CalibState::SUCCESS)
+    {
+        row0 = "CALIB SUCCESS!";
+        row1 = "SAVED + READ VERIFIED";
+        row2 = "NO AUTO HEATING";
+        row3 = "FAN: COOLING";
+    }
+    else if (calib_state == CalibState::ABORT)
+    {
+        row0 = "CALIB ABORTED";
+        row1 = calib_message;
+        row2 = "OLD MODEL KEPT";
+        row3 = "CLICK/HOLD: BACK";
+    }
+    oled.str(x, y, row0, 8, 1, 0);
+    oled.str(x, y + 8, row1, 8, 1, 0);
+    oled.str(x, y + 16, row2, 8, 1, 0);
+    oled.str(x, y + 24, row3, 8, 1, 0);
 }
 
 void UI::write_oled_light()
@@ -646,27 +1097,8 @@ void UI::show_page(short x, short y, uint8_t page)
             oled.str(32, y + 16, menu6_option0_1, 16, 1, 0);
             break;
 
-        case error_temp_fix_num: //温度校准
-
-            oled.chinese(0, y, menu7_option0_0, 16, 1, 1);
-            oled.chinese(0, y + 16, menu7_option0_1, 16, 1, 1);
-            oled.str(64, y, menu7_option0_2, 16, 1, 0);
-            oled.str(64, y + 16, menu7_option0_2, 16, 1, 0);
-            oled.num(72, y, adc.hotbed_max_temp, 3, 16, LEFT, 1);
-            oled.num(72, y + 16, adc.adc_max_temp, 3, 16, LEFT, 1);
-
-            switch (error_temp_fix_page_buf)
-            {
-            case 0:
-                oled.BMP(118, y + 4, circle_kong);
-                break;
-            case 1:
-                oled.BMP(118, y + 4, circle_shi);
-                break;
-            default:
-                oled.BMP(118, y + 20, circle_kong);
-                break;
-            }
+        case error_temp_fix_num: // 温度校准
+            calibration_draw(x, y);
             break;
         }
         break;
@@ -856,94 +1288,6 @@ void UI::temp_mode_move()
     }
 }
 
-extern Ticker adc_max_temp_tic;
-
-void UI::error_temp_fix_page_move()
-{
-    if (error_temp_fix_page_move_buf == 0)
-        return;
-
-    int8_t tmp;
-
-    if (error_temp_fix_page_move_buf == 1)
-    {
-        if (error_temp_fix_page_buf)
-            tmp = 4;
-        else
-            tmp = 20;
-        for (uint8_t x = 1; x < 17; x++)
-        {
-            oled.choose_clr(118, 0, 9, 4);
-            oled.BMP(118, tmp, circle_kong);
-            oled.choose_refresh(118, 0, 9, 4);
-            if (error_temp_fix_page_buf)
-                tmp++;
-            else
-                tmp--;
-            delay(10);
-        }
-    }
-    else
-    {
-
-        if (error_temp_fix_page_buf == 2)
-            tmp = -32;
-        else
-            tmp = 0;
-        for (uint8_t x = 0; x < 33; x++)
-        {
-            oled.clr();
-            show_page(0, tmp, 3);
-            oled.chinese(0, tmp + 32, menu7_option0_3, 16, 1, 1);
-            oled.chinese(0, tmp + 48, menu7_option0_4, 16, 1, 1);
-            oled.BMP(95, tmp + 34, 32, 28, heating, 1);
-            oled.num(64, tmp + 48, adc.now_temp, 3, 16, LEFT, 1);
-            oled.refresh();
-            if (error_temp_fix_page_buf == 2)
-                tmp++;
-            else
-                tmp--;
-            yield();
-        }
-        if (error_temp_fix_page_buf == 3)
-        {
-            adc.adc_max_temp_auto_flg = 0;
-            analogWrite(HEB_PIN, pwm.BED_PWM_PUT);
-            adc_max_temp_tic.attach(20, adc_max_temp_auto_feed);
-            error_temp_fix_page_buf = 4;
-            while (error_temp_fix_page_buf == 4)
-            {
-                if (adc.adc_max_temp_auto())
-                {
-                    analogWrite(HEB_PIN, 0);
-                    break;
-                }
-                oled.choose_clr(64, 2, 24, 2);
-                oled.num(64, 16, adc.now_temp, 3, 16, LEFT, 1);
-                oled.refresh();
-                delay(1000);
-            }
-            adc_max_temp_tic.detach();
-            error_temp_fix_page_buf = 2;
-            adc.adc_max_temp_auto_flg = 1;
-            analogWrite(HEB_PIN, 0);
-            tmp = -32;
-            for (uint8_t x = 0; x < 33; x++)
-            {
-                oled.clr();
-                show_page(0, tmp, 3);
-                oled.chinese(0, tmp + 32, menu7_option0_3, 16, 1, 1);
-                oled.chinese(0, tmp + 48, menu7_option0_4, 16, 1, 1);
-                oled.BMP(95, tmp + 34, 32, 28, heating, 1);
-                oled.num(64, tmp + 48, adc.now_temp, 3, 16, LEFT, 1);
-                oled.refresh();
-                tmp++;
-                yield();
-            }
-        }
-    }
-    error_temp_fix_page_move_buf = 0;
-}
 
 void UI::temp_move()
 {

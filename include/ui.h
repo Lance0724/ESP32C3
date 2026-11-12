@@ -3,6 +3,8 @@
 
 #include "User.h"
 #include "EC11.h"
+#include "CalibStability.h"
+#include "TempCalibration.h"
 
 #define show_disable 0
 #define show_set_temp 1
@@ -21,6 +23,8 @@ class UI
 
 public:
     void run_task();
+    void enqueue_key_event(ec11_task_result_type ec_type, int16_t ec_value);
+    void process_key_event(ec11_task_result_type ec_type, int16_t ec_value);
 
     bool page_switch(uint8_t mode);
 
@@ -55,7 +59,14 @@ private:
     void show_curve(int8_t y, int8_t data_y);
     void temp_time_switch();
     void wake_sleep_page();
-    void error_temp_fix_page_move();
+    void consume_key_events();
+    void calibration_enter();
+    void calibration_exit();
+    void calibration_key(ec11_task_result_type ec_type, int16_t ec_value);
+    void calibration_tick(uint32_t now);
+    void calibration_draw(short x, short y);
+    void calibration_abort(const char *message);
+    void calibration_reset_window();
     void show_warning();
 
     uint8_t set_temp_x = 92;
@@ -66,8 +77,21 @@ private:
 
     bool blinker_config_flg = 0;
     bool write_oled_flg = 0;
-    uint8_t error_temp_fix_page_buf = 0;
-    uint8_t error_temp_fix_page_move_buf = 0;
+    enum class CalibState : uint8_t { IDLE, CONFIRM, WAIT_STABLE, ENTER_VALUE, SAVING, SUCCESS, ABORT };
+    CalibState calib_state = CalibState::IDLE;
+    CalibStability calib_window;
+    TempCalibData calib_candidate;
+    uint8_t calib_point = 0;
+    uint16_t calib_real = 0;
+    uint32_t calib_success_at = 0;
+    uint32_t calib_draw_at = 0;
+    uint32_t calib_input_after = 0;
+    uint32_t calib_window_sequence = 0;
+    const char *calib_message = "";
+    bool calib_previous_speed = false;
+    bool calib_previous_double = true;
+    bool calib_save_banner = false;
+    bool calib_dirty = true;
 };
 
 extern UI ui;

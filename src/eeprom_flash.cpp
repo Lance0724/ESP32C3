@@ -1,6 +1,8 @@
 #include "eeprom_flash.h"
 #include "User.h"
 
+#include <cstring>
+
 eeprom_flash eeprom;
 
 void eeprom_flash::data_init()
@@ -14,6 +16,7 @@ void eeprom_flash::data_init()
     ui.oled_light = 127;
     adc.adc_max_temp = 255;
     adc.hotbed_max_temp = 255;
+    adc.clear_calibration();
 
     write_flg = 2;
 
@@ -24,7 +27,13 @@ void eeprom_flash::read_all_data()
 {
 
     ec11.int_close();
-    EEPROM.begin(eeprom_size);
+    adc.clear_calibration();
+    if (!EEPROM.begin(eeprom_size))
+    {
+        EEPROM.end();
+        ec11.int_work();
+        return;
+    }
     if (EEPROM.read(first_download_add))
     {
         data_init();
@@ -40,15 +49,19 @@ void eeprom_flash::read_all_data()
         curve_temp_buf[1] = (EEPROM.read(temp0_data_start_add + 2) * 256) + EEPROM.read(temp0_data_start_add + 3);
         curve_temp_buf[2] = (EEPROM.read(temp0_data_start_add + 4) * 256) + EEPROM.read(temp0_data_start_add + 5);
         curve_temp_buf[3] = (EEPROM.read(temp0_data_start_add + 6) * 256) + EEPROM.read(temp0_data_start_add + 7);
-        char tmp;
-        for (int x = blinker_id_add; x < eeprom_size; x++)
+        char key[13] = {};
+        bool key_valid = true;
+        for (uint8_t i = 0; i < 12; ++i)
         {
-            tmp = EEPROM.read(x);
-            if (tmp != 0)
-                wifima.blinker_id += tmp;
-            else
-                break;
+            const uint8_t value = EEPROM.read(blinker_id_add + i);
+            key[i] = static_cast<char>(value);
+            if (value < 33 || value > 126)
+                key_valid = false;
         }
+        if (EEPROM.read(blinker_id_add + 12) != 0)
+            key_valid = false;
+        if (key_valid)
+            wifima.blinker_id = String(key);
         Serial.print("Blinker ID:");
         Serial.println(wifima.blinker_id);
         adc.hotbed_max_temp = ((uint16_t)EEPROM.read(hotbed_max_temp_high_add) << 8) | EEPROM.read(hotbed_max_temp_low_add);
@@ -65,6 +78,13 @@ void eeprom_flash::read_all_data()
             EEPROM.write(adc_max_temp_low_add, adc.adc_max_temp & 0xff);
             EEPROM.write(adc_max_temp_high_add, adc.adc_max_temp >> 8);
         }
+
+        uint8_t record[CALIB_RECORD_SIZE];
+        for (size_t i = 0; i < CALIB_RECORD_SIZE; ++i)
+            record[i] = EEPROM.read(temp_calib_record_add + i);
+        TempCalibData loaded;
+        if (decode_temp_calib(record, loaded))
+            adc.set_calibration(loaded);
     }
     EEPROM.commit();
     EEPROM.end();
@@ -90,13 +110,17 @@ void eeprom_flash::write(int add, uint8_t dat)
 
 void eeprom_flash::write_task()
 {
-    if (write_flg == 2)
+    if (write_flg == 2 && !pwm.calibration_active())
     {
-        write_flg = 0;
         ec11.int_close();
         Serial.println("EE WRITE");
 
-        EEPROM.begin(eeprom_size);
+        if (!EEPROM.begin(eeprom_size))
+        {
+            EEPROM.end();
+            ec11.int_work();
+            return;
+        }
 
         EEPROM.write(set_temp_low_add, pwm.temp_buf & 0xff);
         EEPROM.write(set_temp_high_add, pwm.temp_buf >> 8);
@@ -128,24 +152,78 @@ void eeprom_flash::write_task()
         EEPROM.write(adc_max_temp_low_add, adc.adc_max_temp & 0xff);
         EEPROM.write(adc_max_temp_high_add, adc.adc_max_temp >> 8);
 
-        EEPROM.commit();
+        const bool committed = EEPROM.commit();
 
         EEPROM.end();
+        if (committed)
+            write_flg = 0;
 
         Serial.println("END");
         ec11.int_work();
     }
 }
 
+bool eeprom_flash::save_calib_data(const TempCalibData &data)
+{
+    // 调用方仍须等待校准完成且输出归零；这里拒绝活动加热时提交或切换模型。
+    if (pwm.power || pwm.calibration_active())
+        return false;
+    uint8_t expected[CALIB_RECORD_SIZE];
+    if (!encode_temp_calib(data, expected))
+        return false;
+
+    if (!EEPROM.begin(eeprom_size))
+    {
+        EEPROM.end();
+        return false;
+    }
+    for (size_t i = 0; i < CALIB_RECORD_SIZE; ++i)
+        EEPROM.write(temp_calib_record_add + i, expected[i]);
+    const bool committed = EEPROM.commit();
+    EEPROM.end();
+    if (!committed)
+        return false;
+
+    if (!EEPROM.begin(eeprom_size))
+    {
+        EEPROM.end();
+        return false;
+    }
+    uint8_t actual[CALIB_RECORD_SIZE];
+    for (size_t i = 0; i < CALIB_RECORD_SIZE; ++i)
+        actual[i] = EEPROM.read(temp_calib_record_add + i);
+    EEPROM.end();
+
+    TempCalibData verified;
+    if (std::memcmp(expected, actual, CALIB_RECORD_SIZE) != 0 ||
+        !decode_temp_calib(actual, verified))
+        return false;
+    if (pwm.power || pwm.calibration_active())
+        return false;
+    // 使用读回的量化模型，确保本次运行和重启后的映射完全一致。
+    return adc.set_calibration(verified);
+}
+
 void eeprom_flash::write_str(int add, String str)
 {
-    const char *p = &str[0];
-    EEPROM.begin(eeprom_size);
-    while (*p)
+    const size_t length = str.length();
+    if (add < 0 || add >= eeprom_size || length >= static_cast<size_t>(eeprom_size - add))
+        return;
+    if (add == blinker_id_add)
     {
-        EEPROM.write(add++, *p++);
-        yield();
+        if (length != 12)
+            return;
+        for (size_t i = 0; i < length; ++i)
+            if (static_cast<uint8_t>(str[i]) < 33 || static_cast<uint8_t>(str[i]) > 126)
+                return;
     }
-    EEPROM.write(add, '\0');
+    if (!EEPROM.begin(eeprom_size))
+    {
+        EEPROM.end();
+        return;
+    }
+    for (size_t i = 0; i < length; ++i)
+        EEPROM.write(add + i, static_cast<uint8_t>(str[i]));
+    EEPROM.write(add + length, 0);
     EEPROM.end();
 }

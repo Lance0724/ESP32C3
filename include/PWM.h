@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <Ticker.h>
+#include <atomic>
 #include "ADC.h"
 #include "Tick_IRQ.h"
 
@@ -38,6 +39,20 @@
 #define Re_So 0
 #define Co_Temp 1
 
+enum class CalibStop : uint8_t {
+    None, Completed, Cancelled, RemoteOff, Sensor, OverTemp,
+    SampleTimeout, HeartbeatTimeout, PointTimeout, SessionTimeout
+};
+
+struct CalibStatus {
+    bool active = false;
+    bool cooling = false;
+    bool stopped = false;
+    uint8_t point = 0;
+    uint8_t duty = 0;
+    CalibStop reason = CalibStop::None;
+};
+
 
 
 
@@ -50,6 +65,14 @@ class PWM{
     void temp_set();
     void fan();
     void fan_time();
+    bool start_calibration();
+    bool set_calibration_point(uint8_t point);
+    void calibration_heartbeat();
+    void request_calibration_stop(CalibStop reason);
+    CalibStatus calibration_status() const;
+    bool calibration_locked() const;
+    bool calibration_active() const;
+    bool calibration_can_save() const;
     bool power = OFF;
     bool sleep_flg = OFF;
     
@@ -81,6 +104,14 @@ class PWM{
     int16_t pwm_buf = 0;
     float pwm_buf_f = 0;
     friend void pwm_irq();
+    void calibration_tick();
+    CalibStatus calib_status_;
+    std::atomic<uint32_t> calib_stop_{0};
+    uint32_t calib_heartbeat_at_ = 0;
+    uint32_t calib_point_at_ = 0;
+    uint32_t calib_session_at_ = 0;
+    uint32_t calib_cool_at_ = 0;
+    bool calib_cool_tracking_ = false;
     
 
 

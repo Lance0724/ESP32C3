@@ -1,176 +1,181 @@
 #include "ADC.h"
-#include <Ticker.h>
-#include "EC11.h"
 
+#include <cmath>
+#include <limits>
 
-//#define vin4096                2770      //4096时的电压直mV 250/316
-#define vin                    3300      //电源电压，上拉电阻电源段电压mV
+namespace
+{
+constexpr double VIN_MV = 3300.0;
+constexpr double DOWN_RESISTANCE = 20000.0;
+constexpr double REFERENCE_RESISTANCE = 5100.0;
+constexpr double NOMINAL_RESISTANCE = 100000.0;
+constexpr double NOMINAL_KELVIN = 25.0 + 273.15;
+constexpr double B_VALUE = 3950.0;
+constexpr float SAMPLE_TOLERANCE = 200.0f;
+constexpr uint8_t WINDOW_SIZE = 8;
 
-#define downRESISTANCE         20000     //并联下拉降压电阻，
-#define REFERENCE_RESISTANCE   5100 //上拉电阻
-#define NOMINAL_RESISTANCE     100000 // NTC 阻直
-#define NOMINAL_TEMPERATURE    25       //
-#define B_VALUE                3950
-#define ESP32_ANALOG_RESOLUTION   4096 //8位 ACD 1024，12位 ACD 4096
+bool temperature_in_range(float value)
+{
+    return std::isfinite(value) && value >= 0.0f && value <= 400.0f;
+}
 
+bool read_temperature(float &temperature)
+{
+    const double millivolts = analogReadMilliVolts(TEMP_PIN);
+    if (!std::isfinite(millivolts) || millivolts <= 0.0 || millivolts >= VIN_MV)
+        return false;
 
-#define temp_w 200 //采样容差宽度+—30
-//#define ji     100        
-double time_arr[8];
-double Vout = 0.0;
-double vm = 0.0;
-int i_forV = 0;
+    const double divider = 1.0 - millivolts / VIN_MV;
+    if (!std::isfinite(divider) || divider <= 0.0)
+        return false;
+    const double parallel_resistance = millivolts / VIN_MV * REFERENCE_RESISTANCE / divider;
+    const double resistance_denominator = DOWN_RESISTANCE - parallel_resistance;
+    if (!std::isfinite(parallel_resistance) || parallel_resistance <= 0.0 ||
+        !std::isfinite(resistance_denominator) || resistance_denominator <= 0.0)
+        return false;
 
+    // 启动填充与运行采样统一使用原运行时的经验修正，不重新拟合。
+    const double correction = 2770.0 / millivolts * 0.046 + 1.0;
+    const double resistance = DOWN_RESISTANCE * parallel_resistance / resistance_denominator * correction;
+    const double log_argument = resistance / NOMINAL_RESISTANCE;
+    if (!std::isfinite(resistance) || resistance <= 0.0 ||
+        !std::isfinite(log_argument) || log_argument <= 0.0)
+        return false;
 
-Thermistor* thermistor;
+    const double inverse_kelvin = std::log(log_argument) / B_VALUE + 1.0 / NOMINAL_KELVIN;
+    if (!std::isfinite(inverse_kelvin) || inverse_kelvin <= 0.0)
+        return false;
+    temperature = static_cast<float>(1.0 / inverse_kelvin - 273.15);
+    return temperature_in_range(temperature);
+}
+}
 
 ADC adc;
-Ticker adc_max_temp_tic;
 
 ADC::ADC()
 {
-    //pinMode(switch_io, OUTPUT);
-    //digitalWrite(switch_io, channel_low_temp);
-    thermistor = new NTC_Thermistor(
-        TEMP_PIN,
-        REFERENCE_RESISTANCE,
-        NOMINAL_RESISTANCE,
-        NOMINAL_TEMPERATURE,
-        B_VALUE,
-        ESP32_ANALOG_RESOLUTION
-    );
-    //开机时,初始化温度数组数据
-    /*for (int i = 0; i < 10; i++) {
-      time_arr[i] = thermistor->readCelsius();
-      item+=time_arr[i];
-    }*/
-      for (int i = 0; i < 8; i++) {
-    float val = analogReadMilliVolts(TEMP_PIN);
-    float cc = 2771/val * 0.052+1;     //温度纠正,电阻增大，显示温度降低
-    float Drmax = val / vin * REFERENCE_RESISTANCE / (1- val/vin);     //推算电阻
-    float Dr = downRESISTANCE *  Drmax / (downRESISTANCE - Drmax )*cc;    //计算出 NTC T温度电阻
-    float DTimemax = 1 / (log(Dr / NOMINAL_RESISTANCE) / B_VALUE + 1 / (NOMINAL_TEMPERATURE + 273.15)) - 273.15;//温度换算
-    time_arr[i] = DTimemax;
-    vm+=time_arr[i];
-  }
-  Vout = vm/8;
+    // 不在全局构造阶段访问硬件；既有1Hz任务逐次积累八个有效样本。
+}
 
+TempSample ADC::snapshot() const
+{
+    portENTER_CRITICAL(&sample_mux_);
+    const TempSample result = sample_;
+    portEXIT_CRITICAL(&sample_mux_);
+    return result;
+}
+
+void ADC::remap_locked()
+{
+    const float mapped = calibration_enabled_ ? map_calibrated_temp(calibration_, sample_.raw_temp)
+                                               : sample_.raw_temp;
+    sample_.calibrated_temp = mapped;
+    sample_.healthy = input_healthy_ && temperature_in_range(mapped);
+    if (sample_.healthy)
+    {
+        // 未校准保留截断语义；校准后仅在工程范围检查通过时进行四舍五入。
+        now_temp = calibration_enabled_ ? static_cast<uint16_t>(std::lround(mapped))
+                                        : static_cast<uint16_t>(mapped);
+    }
+}
+
+bool ADC::set_calibration(const TempCalibData &data)
+{
+    if (!validate_temp_calib(data))
+        return false;
+    portENTER_CRITICAL(&sample_mux_);
+    calibration_ = data;
+    calibration_enabled_ = true;
+    remap_locked();
+    portEXIT_CRITICAL(&sample_mux_);
+    return true;
+}
+
+void ADC::clear_calibration()
+{
+    portENTER_CRITICAL(&sample_mux_);
+    calibration_enabled_ = false;
+    calibration_ = TempCalibData{};
+    remap_locked();
+    portEXIT_CRITICAL(&sample_mux_);
+}
+
+bool ADC::has_calibration() const
+{
+    portENTER_CRITICAL(&sample_mux_);
+    const bool enabled = calibration_enabled_;
+    portEXIT_CRITICAL(&sample_mux_);
+    return enabled;
+}
+
+float ADC::calibrate_temp(float raw_t) const
+{
+    TempCalibData model;
+    portENTER_CRITICAL(&sample_mux_);
+    const bool enabled = calibration_enabled_;
+    if (enabled)
+        model = calibration_;
+    portEXIT_CRITICAL(&sample_mux_);
+    return enabled ? map_calibrated_temp(model, raw_t) : raw_t;
+}
+
+void ADC::get_temp_task()
+{
+    float instant = std::numeric_limits<float>::quiet_NaN();
+    const bool valid = read_temperature(instant);
+    const uint32_t sampled_at = millis();
+
+    portENTER_CRITICAL(&sample_mux_);
+    ++sample_.sequence;
+    sample_.instant_temp = instant;
+    input_healthy_ = valid;
+    if (valid && temp_count_ != 0 &&
+        std::fabs(sample_.raw_temp - instant) >= SAMPLE_TOLERANCE)
+        input_healthy_ = false;
+
+    if (input_healthy_)
+    {
+        if (temp_count_ == WINDOW_SIZE)
+            temp_sum_ -= temp_window_[temp_index_];
+        else
+            ++temp_count_;
+        temp_window_[temp_index_] = instant;
+        temp_sum_ += instant;
+        temp_index_ = static_cast<uint8_t>((temp_index_ + 1) % WINDOW_SIZE);
+        sample_.raw_temp = static_cast<float>(temp_sum_ / temp_count_);
+        sample_.ready = temp_count_ == WINDOW_SIZE;
+    }
+    remap_locked();
+    // 无效尝试仍递增序号，但不能让旧均值变成一份新的健康样本。
+    if (sample_.healthy)
+        sample_.sampled_at = sampled_at;
+    portEXIT_CRITICAL(&sample_mux_);
 }
 
 void ADC::get()
 {
-    uint8_t i;
-    if (adc_mode_state == channel_low_temp)
-    {
-        for (i = 0; i < 7; i++)
-            adc_buf[i] = adc_buf[i + 1];
-        adc_buf[i] = analogRead(0);
-    }else{
-        for (i = 0; i < 7; i++)
-            adc_buf_high[i] = adc_buf_high[i + 1];
-        adc_buf_high[i] = analogRead(0);
-    }
-
+    uint16_t *buffer = adc_mode_state == channel_low_temp ? adc_buf : adc_buf_high;
+    for (uint8_t i = 0; i < WINDOW_SIZE - 1; ++i)
+        buffer[i] = buffer[i + 1];
+    buffer[WINDOW_SIZE - 1] = analogRead(TEMP_PIN);
     set_channel(!adc_mode_state);
-    }
-    
-
+}
 
 void ADC::get_voltage()
 {
-    uint8_t i;
-    vol_low = 0;
-    for (i = 0; i < 8; i++)
-        vol_low += adc_buf[i];
-    vol_low >>= 3;
-    vol_low = vol_low * 1000 / 4095;
-
-    vol_high = 0;
-    for (i = 0; i < 8; i++)
-        vol_high += adc_buf_high[i];
-    vol_high >>= 3;
-    vol_high = vol_high * 1000 / 4095;
-}
-// 51  150`
-void ADC::get_temp_task()
-{
-    float val = analogReadMilliVolts(TEMP_PIN);
-
-    float cc = 2770/val * 0.046+1;     //温度纠正,电阻增大，显示温度降低
-    float Drmax = val / vin * REFERENCE_RESISTANCE / (1- val/vin);     //推算电阻
-    float Dr = downRESISTANCE *  Drmax / (downRESISTANCE - Drmax )*cc;    //计算出 NTC T温度电阻
-    float DTimemax = 1 / (log(Dr / NOMINAL_RESISTANCE) / B_VALUE + 1 / (NOMINAL_TEMPERATURE + 273.15)) - 273.15;//温度换算
-
-    if ( Vout - DTimemax > -temp_w && temp_w > Vout - DTimemax) {
-     vm += DTimemax-time_arr[i_forV];
-     time_arr[i_forV] = DTimemax;
-     i_forV++;
-     if(i_forV == 8){
-        i_forV = 0;
-        }
-     Vout = vm/8;
-     }
-    now_temp = Vout;
-
-
-    /*
-    const double celsius = thermistor->readCelsius();
-
-    if (item/10-celsius > -temp_w && temp_w > item/10-celsius) {
-        item = item - time_arr[0];
-        for (int i = 0; i < 9; i++) {
-            time_arr[i] = time_arr[i + 1];
-        }
-        time_arr[9] = celsius;
-        item += time_arr[9];
-        //Serial.println(item/10);
+    uint32_t low_sum = 0;
+    uint32_t high_sum = 0;
+    for (uint8_t i = 0; i < WINDOW_SIZE; ++i)
+    {
+        low_sum += adc_buf[i];
+        high_sum += adc_buf_high[i];
     }
-
-
-    ttmep = item/10;//
-    now_temp = ttmep+100;//
-    /*if(ttmep<70){
-        //ttmep += 30;
-        now_temp = ((Parallel_Temp-ttmep)/Parallel_Temp*0.6+1)*ttmep;
-    }else{
-        now_temp = ((Parallel_Temp-ttmep)/Parallel_Temp*0.06+1)*ttmep;
-    }*/
-
+    vol_low = static_cast<uint16_t>((low_sum / WINDOW_SIZE) * 1000 / 4095);
+    vol_high = static_cast<uint16_t>((high_sum / WINDOW_SIZE) * 1000 / 4095);
 }
 
 void ADC::set_channel(bool channel)
 {
     digitalWrite(switch_io, channel);
     adc_mode_state = channel;
-}
-
-static uint16_t last_temp = 0;
-
-void adc_max_temp_auto_feed()
-{
-    /*if (last_temp != adc.now_temp)
-    {
-        last_temp = adc.now_temp;
-    }
-    else
-    {
-        adc.adc_max_temp_auto_flg = 1;
-        if (adc.now_temp != 38)
-        {
-            adc.adc_max_temp = adc.now_temp;
-            ec11.int_close();
-            EEPROM.begin(eeprom_size);
-            EEPROM.write(adc_max_temp_low_add, adc.adc_max_temp & 0xff);
-            EEPROM.write(adc_max_temp_high_add, adc.adc_max_temp >> 8);
-            EEPROM.commit();
-            EEPROM.end();
-            ec11.int_work();
-        }
-        adc_max_temp_tic.detach();
-    }*/
-}
-
-bool ADC::adc_max_temp_auto()
-{
-    return adc_max_temp_auto_flg;
 }

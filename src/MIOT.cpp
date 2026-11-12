@@ -12,6 +12,7 @@ BlinkerSlider Slider1(Slider_1);
 
 void button1_callback(const String &state) //按键事件
 {
+    if (pwm.calibration_locked()) return;
     if (!pwm.power)
     {
         pwm.begin();
@@ -21,6 +22,10 @@ void button1_callback(const String &state) //按键事件
 
 void button2_callback(const String &state) //按键事件
 {
+    if (pwm.calibration_locked()) {
+        pwm.request_calibration_stop(CalibStop::RemoteOff);
+        return;
+    }
     if (pwm.power)
     {
         pwm.end();
@@ -29,6 +34,7 @@ void button2_callback(const String &state) //按键事件
 }
 void button3_callback(const String &state) //按键事件
 {
+    if (pwm.calibration_locked()) return;
     if (!pwm.temp_mode)
     {
         pwm.temp_mode = 1;
@@ -45,6 +51,7 @@ void button3_callback(const String &state) //按键事件
 
 void button4_callback(const String &state) //按键事件
 {
+    if (pwm.calibration_locked()) return;
     if (pwm.temp_mode)
     {
         pwm.temp_mode = 0;
@@ -61,11 +68,13 @@ void button4_callback(const String &state) //按键事件
 
 void button5_callback(const String &state) //按键事件
 {
+    if (pwm.calibration_locked()) return;
     pwm.fan();
 }
 
 void slider1_callback(int32_t value) //滑块处理
 {
+    if (pwm.calibration_locked()) return;
     if (pwm.temp_mode)
     {
         if (value < 40)
@@ -84,6 +93,11 @@ void slider1_callback(int32_t value) //滑块处理
 
 void miotPowerState(const String &state) //电源事件
 {
+    if (pwm.calibration_locked()) {
+        if (state == BLINKER_CMD_OFF)
+            pwm.request_calibration_stop(CalibStop::RemoteOff);
+        return;
+    }
 
     if (state == BLINKER_CMD_ON)
     {
@@ -105,6 +119,7 @@ void miotPowerState(const String &state) //电源事件
 
 void miotColor(int32_t color)
 {
+    if (pwm.calibration_locked()) return;
     if (pwm.temp_mode)
     {
         color &= 0xffffff;
@@ -158,6 +173,7 @@ void miotColor(int32_t color)
 
 void miotMode(uint8_t mode)
 {
+    if (pwm.calibration_locked()) return;
 
     if (mode == BLINKER_CMD_MIOT_DAY)
     { //日光模式

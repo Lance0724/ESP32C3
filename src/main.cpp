@@ -26,7 +26,7 @@ void setup()
 
   miot.begin();
 
-  ec11.begin(9, 8, 10, ui_key_callb);  //定义编码器按钮SW，SWB，SWA
+  ec11.begin(9, 10, 8, ui_key_callb); // SW=9，SA=10，SB=8，右旋增加
   ec11.speed_up(true);
   ec11.speed_up_max(20);
 
